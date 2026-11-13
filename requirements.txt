@@ -2,3 +2,6 @@ gradio
 edge-tts
 requests
 Pillow
+fastapi
+uvicorn
+python-multipart
