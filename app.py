@@ -1017,20 +1017,145 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch):
     return out_mp4, srt_text
 
 
+# ---------------- Gemini TTS (v22) ----------------
+# edge-tts မြန်မာအသံ (Nilar/Thiha) က ဖတ်ပုံ ပြားတယ် — စိတ်ခံစားမှု/
+# အသံနိမ့်အမြင့် ထိန်းလို့ မရဘူး။ Gemini TTS က style ညွှန်ကြားချက်နဲ့
+# အသက်ပါပါ ဖတ်ပြနိုင်တယ် (spooky/natural)။ အားနည်းချက်: word-level
+# timestamp မပေးဘူး → SRT က စာကြောင်းအလိုက် အချိန်ခွဲတဲ့ အရန်နည်း။
+# 2.5 TTS မော်ဒယ်တွေက 2026-11-17 မှာ ပိတ်မယ် + key အသစ်တွေမှာ 404
+# ဖြစ်နိုင်လို့ 3.x TTS မော်ဒယ်တွေပဲ သုံးတယ်။
+GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
+                      "gemini-3.8-flash-lite-tts"]
+GEMINI_TTS_STYLES = {
+    "natural": ("Say with lively, expressive intonation and varied pitch, "
+                "like a warm storyteller, in the Myanmar language:"),
+    "spooky": ("Say in a slow, spooky, dramatic storytelling voice with "
+               "varied pitch and suspenseful pauses, like telling a ghost "
+               "story, in the Myanmar language:"),
+}
+# edge-tts အသံ -> Gemini အသံ အမည် (Nilar = မိန်းကလေး, Thiha = ယောက်ျားလေး)
+GEMINI_VOICE_MAP = {"my-MM-NilarNeural": "Sulafat",
+                    "my-MM-ThihaNeural": "Kore"}
+
+
+def gemini_tts_chunk(api_key, chunk, voice_name, style_prompt):
+    """One text chunk -> WAV bytes. Tries the TTS models in order."""
+    import base64
+    import io
+    import wave
+    body = {"contents": [{"parts": [{"text": f"{style_prompt} {chunk}"}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig":
+                                                 {"voiceName": voice_name}}}}}
+    last_err = None
+    for model in GEMINI_TTS_MODELS:
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                json=body, headers={"x-goog-api-key": api_key}, timeout=300)
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            continue
+        if resp.status_code in (400, 404, 503, 429):
+            last_err = RuntimeError(f"{model}: HTTP {resp.status_code}")
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Gemini TTS error {resp.status_code}: {resp.text[:200]}")
+        try:
+            part = resp.json()["candidates"][0]["content"]["parts"][0]
+            inline = part["inlineData"]
+            raw = base64.b64decode(inline["data"])
+            mime = inline.get("mimeType", "")
+        except (KeyError, IndexError, ValueError) as e:
+            last_err = e
+            continue
+        if "wav" in mime.lower():
+            return raw
+        # PCM L16: wrap in a WAV header (sample rate from the mime type).
+        m = re.search(r"rate=(\d+)", mime)
+        rate = int(m.group(1)) if m else 24000
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(raw)
+        return buf.getvalue()
+    raise RuntimeError("Gemini အသံ ထုတ်လို့ မရဘူး။" +
+                       (f" ({last_err})" if last_err else ""))
+
+
+def synthesize_gemini_tts(text, voice_name, style, api_key):
+    """Text -> same 6-tuple as synthesize_tts, via Gemini TTS.
+    Cues are per-sentence, split proportionally within each chunk's
+    measured duration (Gemini returns no word timestamps)."""
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("စာသား ရိုက်ထည့်ပါ။")
+    if not (api_key or "").strip():
+        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+    style_prompt = GEMINI_TTS_STYLES.get(style, GEMINI_TTS_STYLES["natural"])
+    workdir = tempfile.mkdtemp(prefix="tts_app_")
+    chunk_files = []
+    all_cues = []
+    shift = 0.0
+    idx = 0
+    for ch in chunk_text(text):
+        wav = gemini_tts_chunk(api_key, ch, voice_name, style_prompt)
+        if not wav:
+            raise RuntimeError("အသံ ထုတ်လို့ မရဘူး။ ထပ်စမ်းကြည့်ပါ။")
+        cf = os.path.join(workdir, f"part{idx}.wav")
+        with open(cf, "wb") as f:
+            f.write(wav)
+        chunk_files.append(cf)
+        dur = probe_duration(cf)
+        for (s, e, t) in build_tts_cues(ch, [], dur):
+            all_cues.append((s + shift, e + shift, t))
+        shift += dur
+        idx += 1
+    list_path = os.path.join(workdir, "parts.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for cf in chunk_files:
+            f.write(f"file '{cf}'\n")
+    out_mp3 = os.path.join(workdir, "narration.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                        "-c:a", "libmp3lame", "-q:a", "4", out_mp3],
+                       capture_output=True, text=True, errors="ignore", timeout=600)
+    if r.returncode != 0 or not os.path.exists(out_mp3):
+        raise RuntimeError("အသံဖိုင် ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
+    total = probe_duration(out_mp3)
+    srt_path = os.path.join(workdir, "narration.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for k, (start, end, s) in enumerate(all_cues):
+            f.write(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{s}\n\n")
+    with open(srt_path, encoding="utf-8") as f:
+        srt_text = f.read()
+    return out_mp3, srt_path, srt_text, total, len(all_cues), workdir
+
+
 # ---------------- Image + narration -> Video (v21) ----------------
 # သုံးစွဲသူက ပုံ တစ်ပုံ ထည့်ပြီး စာသား ရိုက်ထည့်ရုံနဲ့ Video တစ်ပုဒ် ထွက်တယ်:
 # ပုံ (ဖြည်းဖြည်း zoom-in) + မြန်မာ AI အသံ + မြန်မာစာတန်း burn-in။
 # အသံကို manual (အသံတစ်မျိုး) သို့မဟုတ် auto (ဇာတ်ကောင် အလိုက် ခွဲ) နဲ့ ထုတ်နိုင်တယ်။
 
 def build_narrated_image_video(workdir, img_path, text, voice, rate, pitch,
-                               mode, api_key):
+                               mode, api_key, engine="edge", style="natural"):
     """(image, text) -> (finished mp4 path, SRT text). The narration mp3 is
-    also left in the workdir as narration.mp3 for the /audio route."""
+    also left in the workdir as narration.mp3 for the /audio route.
+    engine "gemini" uses expressive Gemini TTS (manual voice only; the
+    auto split is an edge-tts feature and is ignored for Gemini)."""
     import shutil
     font_path = find_myanmar_font()
     if font_path is None:
         raise RuntimeError("မြန်မာစာလုံး (font) မတွေ့ဘူး။")
-    if mode == "auto":
+    if engine == "gemini":
+        key = (api_key or "").strip() or SECRET_KEY
+        gemini_voice = GEMINI_VOICE_MAP.get(voice, "Sulafat")
+        out_mp3, _srt_path, srt_text, total, _n, tts_dir = \
+            synthesize_gemini_tts(text, gemini_voice, style, key)
+    elif mode == "auto":
         key = (api_key or "").strip() or SECRET_KEY
         if not key:
             raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
@@ -1088,7 +1213,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v21 (image narration + auto voice split)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v23 (video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1097,8 +1222,10 @@ with gr.Blocks(title="Zhang Studio") as demo:
         video_in = gr.Video(label="ဗီဒီယို တင်ပါ")
         btn1 = gr.Button("စာတန်းထိုးမယ်")
         status1 = gr.Textbox(label="အခြေအနေ")
-        srt_out1 = gr.Textbox(label="SRT စာသား", lines=10)
+        # v23: ထွက်လာတဲ့ video ကို SRT box အပေါ်မှာ ပြထားတယ် —
+        # scroll ဆွဲစရာ မလိုပဲ ရလဒ်ကို တန်း ကြည့်လို့ ရအောင်။
         video_out = gr.Video(label="စာတန်းထိုးပါတဲ့ video")
+        srt_out1 = gr.Textbox(label="SRT စာသား", lines=10)
         file_out1 = gr.File(label="SRT ဖိုင် download")
         btn1.click(fn=process_subtitle, inputs=[key_box, video_in],
                    outputs=[status1, srt_out1, video_out, file_out1])
@@ -1271,12 +1398,14 @@ if os.environ.get("RENDER"):
             _jobs[job_id] = result
 
     def _run_narrate_image_job(job_id, img_tmp_path, text, api_key,
-                               voice, rate, pitch, mode):
+                               voice, rate, pitch, mode,
+                               engine="edge", style="natural"):
         import shutil
         workdir = tempfile.mkdtemp(prefix="narrate_image_")
         try:
             _out_mp4, srt_text = build_narrated_image_video(
-                workdir, img_tmp_path, text, voice, rate, pitch, mode, api_key)
+                workdir, img_tmp_path, text, voice, rate, pitch, mode,
+                api_key, engine, style)
             result = {"status": "done", "srt": srt_text,
                       "audio_url": f"/api/download/{job_id}/audio",
                       "video_url": f"/api/download/{job_id}/video"}
@@ -1290,6 +1419,21 @@ if os.environ.get("RENDER"):
                 os.unlink(img_tmp_path)
             except Exception:
                 pass
+        with _jobs_lock:
+            _jobs[job_id] = result
+
+    def _run_gemini_tts_job(job_id, text, api_key, voice, style):
+        import shutil
+        try:
+            key = (api_key or "").strip() or SECRET_KEY
+            _out_mp3, _srt_path, srt_text, total, n_cues, workdir = \
+                synthesize_gemini_tts(text, voice, style, key)
+            result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
         with _jobs_lock:
             _jobs[job_id] = result
 
@@ -1360,6 +1504,31 @@ if os.environ.get("RENDER"):
             return JSONResponse(status_code=404, content={"error": "audio not ready"})
         return FileResponse(mp3_path, media_type="audio/mpeg", filename="narration.mp3")
 
+    @api_app.post("/api/gemini-tts")
+    def api_gemini_tts(text: str = Form(...), api_key: str = Form(None),
+                       voice: str = Form("Sulafat"),
+                       style: str = Form("natural")):
+        text = (text or "").strip()
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "empty text"})
+        if len(text) > 15000:
+            return JSONResponse(status_code=400,
+                                content={"error": "စာသား အရမ်းရှည်ပါတယ်။ အက္ခရာ 15000 ထက် မပိုအောင် လျှော့ပါ။"})
+        if voice not in ("Sulafat", "Kore", "Aoede", "Charon",
+                         "Zephyr", "Fenrir", "Leda", "Puck"):
+            voice = "Sulafat"
+        if style not in ("natural", "spooky"):
+            style = "natural"
+        job_id = uuid.uuid4().hex
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "pending"}
+        _prune_jobs()
+        t = threading.Thread(target=_run_gemini_tts_job,
+                             args=(job_id, text, api_key, voice, style),
+                             daemon=True)
+        t.start()
+        return JSONResponse(status_code=202, content={"job_id": job_id})
+
     @api_app.post("/api/voiceover")
     def api_voiceover(video: UploadFile = File(...), api_key: str = Form(None),
                       voice: str = Form("my-MM-NilarNeural"),
@@ -1427,7 +1596,9 @@ if os.environ.get("RENDER"):
                           text: str = Form(...), api_key: str = Form(None),
                           voice: str = Form("my-MM-NilarNeural"),
                           rate: int = Form(0), pitch: int = Form(0),
-                          mode: str = Form("manual")):
+                          mode: str = Form("manual"),
+                          engine: str = Form("edge"),
+                          style: str = Form("natural")):
         text = (text or "").strip()
         if not text:
             return JSONResponse(status_code=400, content={"error": "empty text"})
@@ -1440,6 +1611,10 @@ if os.environ.get("RENDER"):
         pitch = max(-50, min(50, pitch))
         if mode not in ("manual", "auto"):
             mode = "manual"
+        if engine not in ("edge", "gemini"):
+            engine = "edge"
+        if style not in ("natural", "spooky"):
+            style = "natural"
         tmp = None
         try:
             data = image.file.read()
@@ -1456,7 +1631,8 @@ if os.environ.get("RENDER"):
             _prune_jobs()
             t = threading.Thread(target=_run_narrate_image_job,
                                  args=(job_id, tmp.name, text, api_key,
-                                       voice, rate, pitch, mode),
+                                       voice, rate, pitch, mode,
+                                       engine, style),
                                  daemon=True)
             t.start()
             return JSONResponse(status_code=202, content={"job_id": job_id})
