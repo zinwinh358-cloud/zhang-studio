@@ -846,6 +846,145 @@ def synthesize_voiced_segments(segments, rate):
     return out_mp3, srt_path, srt_text, total, len(cues), workdir
 
 
+# ---------------- Timed voiceover narration (v24) ----------------
+# Dubbing လုပ်တဲ့အခါ မြန်မာအသံက ရုပ်ပုံနဲ့ လိုက်ဖက်အောင်: transcription
+# cue တွေကို အသံတိတ်သွားတဲ့ နေရာတွေမှာ block တွေ ခွဲပြီး၊ block တစ်ခုစီကို
+# သူ့ cue start time မှာ စအောင် နေရာချတယ် (adelay + amix)။ အသံဆက်တိုက်
+# ဖတ်တာထက် အချိန်ကိုက် ပိုမှန်တယ်။ တစ်ခုခု လွဲရင် အရင် continuous နည်းလမ်း
+# (fallback) ကို သုံးတယ်။
+
+def _group_cues_into_blocks(cues, gap_threshold=1.0, max_blocks=200):
+    """[(start, end, text)] -> [(start, end, text)] blocks.
+    A new block starts when the silence gap after the previous cue exceeds
+    the threshold. If there are still too many blocks, the threshold grows
+    until the count fits (keeps the ffmpeg filter graph manageable)."""
+    threshold = gap_threshold
+    while True:
+        blocks = []
+        for start, end, text in cues:
+            if blocks and start - blocks[-1][1] <= threshold:
+                ps, _pe, ptext = blocks[-1]
+                blocks[-1] = (ps, end, ptext + " " + text)
+            else:
+                blocks.append((start, end, text))
+        if len(blocks) <= max_blocks or threshold >= 8.0:
+            return blocks
+        threshold *= 2.0
+
+
+def _synth_block_mp3(text, voice, rate_str, pitch_str, workdir, tag):
+    """One block of text -> (mp3 path, duration). Chunked like synthesize_tts."""
+    chunk_files = []
+    for i, ch in enumerate(chunk_text(text)):
+        audio, _bounds = edge_synthesize(ch, voice, rate_str, pitch_str)
+        if not audio:
+            raise RuntimeError("အသံ ထုတ်လို့ မရဘူး။ ထပ်စမ်းကြည့်ပါ။")
+        cf = os.path.join(workdir, f"blk{tag}_{i}.mp3")
+        with open(cf, "wb") as f:
+            f.write(audio)
+        chunk_files.append(cf)
+    if len(chunk_files) == 1:
+        return chunk_files[0], probe_duration(chunk_files[0])
+    list_path = os.path.join(workdir, f"blk{tag}.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for cf in chunk_files:
+            f.write(f"file '{cf}'\n")
+    out = os.path.join(workdir, f"blk{tag}.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                        "-c:a", "libmp3lame", "-q:a", "4", out],
+                       capture_output=True, text=True, errors="ignore", timeout=300)
+    if r.returncode != 0 or not os.path.exists(out):
+        raise RuntimeError("အသံဖိုင် ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
+    return out, probe_duration(out)
+
+
+def _block_voice_map(blocks, segments, default_voice):
+    """Assign each block the voice of the auto-split segment it belongs to.
+    Segments are in the same order as the blocks, so a moving pointer over
+    the normalized text finds each block's segment."""
+    def norm(s):
+        return re.sub(r"\s+", "", s)
+    spans = []
+    pos = 0
+    for seg_text, voice in segments:
+        n = norm(seg_text)
+        spans.append((pos, pos + len(n), voice))
+        pos += len(n)
+    full = "".join(norm(t) for t, _v in segments)
+    voices = []
+    cursor = 0
+    for _s, _e, text in blocks:
+        n = norm(text)
+        at = full.find(n[:40], cursor) if n else -1
+        if at < 0:
+            voices.append(voices[-1] if voices else default_voice)
+            continue
+        cursor = at
+        voice = default_voice
+        for s0, s1, v in spans:
+            if s0 <= at < s1:
+                voice = v
+                break
+        voices.append(voice)
+    return voices
+
+
+def build_timed_narration(workdir, cues, video_duration, voice, rate, pitch,
+                          segments=None):
+    """Cue-timed narration mp3: each speech block starts at its cue time.
+    Returns the mp3 path. Raises on failure (caller falls back)."""
+    blocks = _group_cues_into_blocks(cues)
+    if not blocks:
+        raise RuntimeError("စာတန်း မတွေ့ဘူး။")
+    rate_str = f"{int(rate):+d}%"
+    pitch_str = f"{int(pitch):+d}Hz"
+    if segments:
+        voices = _block_voice_map(blocks, segments, voice)
+    else:
+        voices = [voice] * len(blocks)
+    fitted = []
+    for i, (start, _end, text) in enumerate(blocks):
+        path, dur = _synth_block_mp3(text, voices[i], rate_str, pitch_str,
+                                      workdir, i)
+        slot = ((blocks[i + 1][0] - start) if i + 1 < len(blocks)
+                else (video_duration - start))
+        slot = max(1.0, slot)
+        if dur > slot:
+            # Block အသံက slot ထက် ရှည်ရင် အနည်းငယ် မြန်အောင် လုပ်ပြီး
+            # slot အတွင်း ဖြတ်တယ် (နောက် block အချိန်မှန်စဖို့)။
+            factor = min(dur / slot, 1.6)
+            fit = os.path.join(workdir, f"fit{i}.mp3")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", path, "-filter:a",
+                 f"atempo={factor:.3f}", "-t", f"{slot:.3f}",
+                 "-c:a", "libmp3lame", "-q:a", "4", fit],
+                capture_output=True, text=True, errors="ignore", timeout=300)
+            if r.returncode == 0 and os.path.exists(fit):
+                path = fit
+        fitted.append((start, path))
+    # Place every block at its start time and mix into one track.
+    inputs = []
+    filters = []
+    mix_inputs = []
+    for i, (start, path) in enumerate(fitted):
+        inputs += ["-i", path]
+        delay_ms = int(round(start * 1000))
+        filters.append(f"[{i}:a]adelay={delay_ms}[a{i}]")
+        mix_inputs.append(f"[a{i}]")
+    filters.append(
+        "".join(mix_inputs) +
+        f"amix=inputs={len(fitted)}:normalize=0,apad,atrim=0:{video_duration:.3f}[aout]")
+    out_mp3 = os.path.join(workdir, "narration.mp3")
+    r = subprocess.run(
+        ["ffmpeg", "-y"] + inputs +
+        ["-filter_complex", ";".join(filters),
+         "-map", "[aout]", "-c:a", "libmp3lame", "-q:a", "4", out_mp3],
+        capture_output=True, text=True, errors="ignore", timeout=600)
+    if r.returncode != 0 or not os.path.exists(out_mp3):
+        raise RuntimeError("အသံ အချိန်ကိုက် ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
+    return out_mp3
+
+
 def process_tts(text, voice_label, rate, pitch):
     try:
         voice = VOICES.get(voice_label, "my-MM-NilarNeural")
@@ -1213,7 +1352,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v23 (video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v24 (timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1338,19 +1477,46 @@ if os.environ.get("RENDER"):
             ).strip()
             if not narration:
                 raise RuntimeError("ဒီ Video မှာ အသံမတွေ့ဘူး။")
-            if mode == "auto":
-                key = (api_key or "").strip() or SECRET_KEY
-                if not key:
-                    raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
-                try:
-                    segments = split_voices(key, narration)
-                except Exception:
-                    segments = [(narration, voice)]
-                out_mp3, _srt_path, tts_srt, _total, _n, workdir = \
-                    synthesize_voiced_segments(segments, rate)
-            else:
-                out_mp3, _srt_path, tts_srt, _total, _n, workdir = synthesize_tts(
-                    narration, voice, rate, pitch)
+            video_duration = probe_duration(tmp_path) or 0.0
+            workdir = None
+            out_mp3 = None
+            # v24: cue-timed narration so the Myanmar voice starts each line
+            # when the original line starts. Any failure falls back to the
+            # continuous narration (old behaviour) so the job still succeeds.
+            try:
+                cues = parse_srt_text(srt_text, video_duration)
+                segments = None
+                if mode == "auto":
+                    key = (api_key or "").strip() or SECRET_KEY
+                    if not key:
+                        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                    try:
+                        segments = split_voices(key, narration)
+                    except Exception:
+                        segments = None
+                workdir = tempfile.mkdtemp(prefix="tts_app_")
+                out_mp3 = build_timed_narration(
+                    workdir, cues, video_duration, voice, rate, pitch, segments)
+            except Exception:
+                if workdir:
+                    import shutil
+                    shutil.rmtree(workdir, ignore_errors=True)
+                workdir = None
+                out_mp3 = None
+            if out_mp3 is None:
+                if mode == "auto":
+                    key = (api_key or "").strip() or SECRET_KEY
+                    if not key:
+                        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                    try:
+                        segments = split_voices(key, narration)
+                    except Exception:
+                        segments = [(narration, voice)]
+                    out_mp3, _srt_path, _tts_srt, _total, _n, workdir = \
+                        synthesize_voiced_segments(segments, rate)
+                else:
+                    out_mp3, _srt_path, _tts_srt, _total, _n, workdir = synthesize_tts(
+                        narration, voice, rate, pitch)
             out_mp4 = os.path.join(workdir, "voiceover.mp4")
             # Video stream copied (no re-encode = fast); narration becomes
             # the audio track. Original audio is replaced so the old
@@ -1362,7 +1528,7 @@ if os.environ.get("RENDER"):
                 capture_output=True, text=True, errors="ignore", timeout=600)
             if r.returncode != 0 or not os.path.exists(out_mp4):
                 raise RuntimeError("Video နဲ့ အသံ တွဲလို့ မရဘူး: " + r.stderr[-200:])
-            result = {"status": "done", "srt": tts_srt,
+            result = {"status": "done", "srt": srt_text,
                       "audio_url": f"/api/download/{job_id}/audio",
                       "video_url": f"/api/download/{job_id}/video"}
             with _jobs_lock:
