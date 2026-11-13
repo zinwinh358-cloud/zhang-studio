@@ -13,6 +13,7 @@
 # v8 (2026-11-13): Render.com (အခမဲ့ အမြဲ link) ပါ အလုပ်ဖြစ်အောင် — RENDER env ရှိရင် 0.0.0.0:$PORT မှာ run, share ပိတ်, font install ကျော်။
 # v9 (2026-11-13): Render အခမဲ့ CPU မှာ မြန်အောင် — output ကို အရှည်ဆုံး ဘက် 1280 အထိ ချုံ့ + SRT ကို အရင် ပြခြင်း (video စောင့်နေစဉ် SRT ရပြီ)။
 # v10 (2026-11-13): Gemini call တစ်ခု ငြိမ်သွားရင် (read timeout) အလုပ်ရပ်မသွားအောင် — model တစ်ခုချင်းစီကို try/except နဲ့ ကာ + timeout 180s + နောက် model ကို အလိုလို ပြောင်းသုံးခြင်း။
+# v11 (2026-11-13): Burn မြန်အောင် — cue PNG တွေကို frame အပြည့် အစား အောက်ခြေ band လေးပဲ ဆွဲခြင်း (overlay=0:<y>) + gemini-3.6-flash ကို ပထမ model အဖြစ် ထားခြင်း (3.8-flash 2 ခါ ငြိမ်သွားလို့)။
 
 import glob
 import os
@@ -85,7 +86,7 @@ FAVICON_PATH = _local_or_download(
     "zhang-studio-favicon.png",
     "https://muse.ai/files/1475283228992014/1148245037715311/56ul0wu34oapc6mosgqmm17z/zhang-studio-favicon.png")
 
-CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite",
+CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite",
                     "gemini-3.7-flash", "gemini-flash-latest", "gemini-3.5-flash",
                     "gemini-2.5-flash", "gemini-2.0-flash"]
 
@@ -286,13 +287,21 @@ def wrap_text(draw, text, font, max_w):
 
 
 def render_cue_png(text, w, h, font_path, font_size, out_path):
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    # Band-sized PNG: အောက်ခြေ စာတန်း အပိုင်းလေးပဲ ဆွဲမယ် (frame အပြည့် မဟုတ်ဘူး) —
+    # overlay filter က pixel နည်းနည်းပဲ ရောရတော့ burn မြန်တယ်။ စာရဲ့ နေရာအတိအကျ မပြောင်းဘူး။
     font = ImageFont.truetype(font_path, font_size)
-    lines = wrap_text(draw, text, font, int(w * 0.9))
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+    lines = wrap_text(measure, text, font, int(w * 0.9))
     line_h = font_size + int(font_size * 0.35)
-    y = h - int(h * 0.08) - line_h * len(lines)
     stroke = max(2, font_size // 16)
+    pad = stroke + 4
+    band_h = line_h * len(lines) + 2 * pad
+    band_top = h - int(h * 0.08) - line_h * len(lines) - pad
+    band_top = max(0, band_top)
+    band_h = min(band_h, h - band_top)
+    img = Image.new("RGBA", (w, band_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    y = pad
     for ln in lines:
         tw = draw.textlength(ln, font=font)
         x = (w - tw) / 2
@@ -300,6 +309,7 @@ def render_cue_png(text, w, h, font_path, font_size, out_path):
                   stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
         y += line_h
     img.save(out_path)
+    return band_top
 
 
 def burn_subtitles(video_path, cues, out_path, font_path):
@@ -313,16 +323,16 @@ def burn_subtitles(video_path, cues, out_path, font_path):
     pngs = []
     for k, (start, end, text) in enumerate(cues):
         p = os.path.join(tmpdir, f"cue_{k}.png")
-        render_cue_png(text, sw, sh, font_path, font_size, p)
-        pngs.append((p, start, end))
+        y_off = render_cue_png(text, sw, sh, font_path, font_size, p)
+        pngs.append((p, start, end, y_off))
     cmd = ["ffmpeg", "-y", "-i", video_path]
-    for p, _, _ in pngs:
+    for p, _, _, _ in pngs:
         cmd += ["-loop", "1", "-t", str(duration), "-i", p]
     filt = f"[0:v]scale={sw}:{sh}[base];"
     prev = "base"
-    for k, (_, start, end) in enumerate(pngs):
+    for k, (_, start, end, y_off) in enumerate(pngs):
         out = f"v{k}"
-        filt += f"[{prev}][{k + 1}:v]overlay=0:0:enable='between(t,{start:.3f},{end:.3f})'[{out}];"
+        filt += f"[{prev}][{k + 1}:v]overlay=0:{y_off}:enable='between(t,{start:.3f},{end:.3f})'[{out}];"
         prev = out
     cmd += ["-filter_complex", filt.rstrip(";"),
             "-map", f"[{prev}]", "-map", "0:a",
@@ -536,7 +546,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v10 (မြန်နှုန်း မြှင့်)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v11 (မြန်နှုန်း မြှင့်)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
