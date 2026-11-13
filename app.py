@@ -694,6 +694,158 @@ def synthesize_tts(text, voice, rate, pitch):
     return out_mp3, srt_path, srt_text, total, len(cues), workdir
 
 
+# ---------------- Auto voice split by character (v20) ----------------
+# AI က စာသားကို ဇာတ်ကောင် အလိုက် အပိုင်းခွဲပြီး မိန်းကလေး/ယောက်ျားလေး
+# အသံ သင့်တော်ရာကို ခွဲပေးတယ်။ Gemini TEXT သုံးတယ် (Key လိုတယ်)။
+# ခွဲတာ မအောင်မြင်ရင် အသံတစ်မျိုး (fallback voice) နဲ့ ဖတ်ပြတယ်။
+
+VOICE_FEMALE = "my-MM-NilarNeural"
+VOICE_MALE = "my-MM-ThihaNeural"
+
+
+def split_voices(api_key, text):
+    """Text -> [(segment_text, voice_id)] in order. Raises RuntimeError
+    if no Gemini model returns a usable split; the caller falls back to
+    a single voice. The joined segments must equal the original text
+    (ignoring whitespace) — anything added, dropped or reworded fails."""
+    import json
+    instruction = (
+        "You split a Myanmar (Burmese) story text into speaking parts by character, "
+        "so each part can be read aloud in a suitable male or female voice. "
+        "Rules: 1) Split ONLY at speaker changes (dialogue turns, or narration vs "
+        "dialogue). Keep each part as long as possible — do not split every sentence. "
+        "2) Copy the text EXACTLY, character for character — never add, remove or "
+        "change a single word or punctuation mark. The parts joined together must "
+        "equal the original text exactly. "
+        "3) For each part choose \"female\" or \"male\": dialogue uses the speaking "
+        "character's gender (infer from names, pronouns, and context); narration "
+        "uses the main character's voice if clear, otherwise \"female\". "
+        "4) If the text has only one speaker or no dialogue, return it as ONE part. "
+        "Return ONLY valid JSON: a list of objects with keys \"text\" and \"voice\". "
+        "No other text."
+    )
+    payload = {
+        "contents": [{"parts": [{"text": instruction + "\n\nText:\n" + text}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
+    }
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+    def norm(s):
+        return re.sub(r"\s+", "", s)
+
+    want = norm(text)
+    for name in CANDIDATE_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=120)
+        except requests.exceptions.RequestException:
+            continue
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
+            cands = data.get("candidates", [])
+            parts = cands[0].get("content", {}).get("parts", []) if cands else []
+            texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+            if not texts:
+                continue
+            raw = "\n".join(texts).strip()
+            parsed = None
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                try:
+                    parsed = json.loads(re.sub(r"```\w*", "", raw).strip())
+                except ValueError:
+                    continue
+            if not isinstance(parsed, list) or not parsed or len(parsed) > 80:
+                continue
+            segments = []
+            ok = True
+            for item in parsed:
+                if not isinstance(item, dict):
+                    ok = False
+                    break
+                seg = str(item.get("text", "")).strip()
+                v = str(item.get("voice", "")).strip().lower()
+                if not seg:
+                    ok = False
+                    break
+                if v.startswith("f"):
+                    voice = VOICE_FEMALE
+                elif v.startswith("m"):
+                    voice = VOICE_MALE
+                else:
+                    ok = False
+                    break
+                segments.append((seg, voice))
+            if not ok:
+                continue
+            if norm("".join(t for t, _v in segments)) != want:
+                continue
+            return segments
+        if resp.status_code in (400, 404, 503, 429):
+            continue
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+    raise RuntimeError("အသံခွဲလို့ မရဘူး။")
+
+
+def synthesize_voiced_segments(segments, rate):
+    """[(text, voice_id)] -> same 6-tuple as synthesize_tts.
+    Each segment is chunked and synthesized with its own voice; the audio
+    is concatenated and one SRT is built over the whole text."""
+    full_text = " ".join(t.strip() for t, _v in segments).strip()
+    if not full_text:
+        raise RuntimeError("စာသား ရိုက်ထည့်ပါ။")
+    rate_str = f"{int(rate):+d}%"
+    pitch_str = "+0Hz"
+    workdir = tempfile.mkdtemp(prefix="tts_app_")
+    chunk_files = []
+    all_bounds = []
+    shift = 0.0
+    idx = 0
+    for seg_text, voice in segments:
+        for ch in chunk_text(seg_text):
+            audio, bounds = edge_synthesize(ch, voice, rate_str, pitch_str)
+            if not audio:
+                raise RuntimeError("အသံ ထုတ်လို့ မရဘူး။ ထပ်စမ်းကြည့်ပါ။")
+            cf = os.path.join(workdir, f"part{idx}.mp3")
+            with open(cf, "wb") as f:
+                f.write(audio)
+            chunk_files.append(cf)
+            dur = probe_duration(cf)
+            for (s, e, w) in bounds:
+                all_bounds.append((s + shift, e + shift, w))
+            shift += dur
+            idx += 1
+    list_path = os.path.join(workdir, "parts.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for cf in chunk_files:
+            f.write(f"file '{cf}'\n")
+    out_mp3 = os.path.join(workdir, "narration.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                        "-c:a", "libmp3lame", "-q:a", "4", out_mp3],
+                       capture_output=True, text=True, errors="ignore", timeout=600)
+    if r.returncode != 0 or not os.path.exists(out_mp3):
+        raise RuntimeError("အသံဖိုင် ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
+    total = probe_duration(out_mp3)
+    cues = build_tts_cues(full_text, all_bounds, total)
+    srt_path = os.path.join(workdir, "narration.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for k, (start, end, s) in enumerate(cues):
+            f.write(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{s}\n\n")
+    with open(srt_path, encoding="utf-8") as f:
+        srt_text = f.read()
+    return out_mp3, srt_path, srt_text, total, len(cues), workdir
+
+
 def process_tts(text, voice_label, rate, pitch):
     try:
         voice = VOICES.get(voice_label, "my-MM-NilarNeural")
@@ -876,7 +1028,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v19 (TTS 15000 chars + exact timing + prompt-video API)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v20 (auto voice split + TTS 15000 chars)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -964,10 +1116,21 @@ if os.environ.get("RENDER"):
         with _jobs_lock:
             _jobs[job_id] = result
 
-    def _run_tts_job(job_id, text, voice, rate, pitch):
+    def _run_tts_job(job_id, text, voice, rate, pitch, mode="manual", api_key=None):
         try:
-            out_mp3, _srt_path, srt_text, _total, _n, workdir = synthesize_tts(
-                text, voice, rate, pitch)
+            if mode == "auto":
+                key = (api_key or "").strip() or SECRET_KEY
+                if not key:
+                    raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                try:
+                    segments = split_voices(key, text)
+                except Exception:
+                    segments = [(text, voice)]
+                out_mp3, _srt_path, srt_text, _total, _n, workdir = \
+                    synthesize_voiced_segments(segments, rate)
+            else:
+                out_mp3, _srt_path, srt_text, _total, _n, workdir = synthesize_tts(
+                    text, voice, rate, pitch)
             result = {"status": "done", "srt": srt_text,
                       "audio_url": f"/api/download/{job_id}/audio"}
             with _jobs_lock:
@@ -977,7 +1140,7 @@ if os.environ.get("RENDER"):
         with _jobs_lock:
             _jobs[job_id] = result
 
-    def _run_voiceover_job(job_id, tmp_path, api_key, voice, rate, pitch):
+    def _run_voiceover_job(job_id, tmp_path, api_key, voice, rate, pitch, mode="manual"):
         try:
             _model_name, srt_text = transcribe_video_file(tmp_path, api_key)
             # Narration text = the transcribed/translated lines in order.
@@ -988,8 +1151,19 @@ if os.environ.get("RENDER"):
             ).strip()
             if not narration:
                 raise RuntimeError("ဒီ Video မှာ အသံမတွေ့ဘူး။")
-            out_mp3, _srt_path, tts_srt, _total, _n, workdir = synthesize_tts(
-                narration, voice, rate, pitch)
+            if mode == "auto":
+                key = (api_key or "").strip() or SECRET_KEY
+                if not key:
+                    raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                try:
+                    segments = split_voices(key, narration)
+                except Exception:
+                    segments = [(narration, voice)]
+                out_mp3, _srt_path, tts_srt, _total, _n, workdir = \
+                    synthesize_voiced_segments(segments, rate)
+            else:
+                out_mp3, _srt_path, tts_srt, _total, _n, workdir = synthesize_tts(
+                    narration, voice, rate, pitch)
             out_mp4 = os.path.join(workdir, "voiceover.mp4")
             # Video stream copied (no re-encode = fast); narration becomes
             # the audio track. Original audio is replaced so the old
@@ -1065,8 +1239,10 @@ if os.environ.get("RENDER"):
 
     @api_app.post("/api/tts")
     def api_tts(text: str = Form(...), voice: str = Form("my-MM-NilarNeural"),
-                rate: int = Form(0), pitch: int = Form(0)):
-        # No Gemini key needed: edge-tts is a free voice service.
+                rate: int = Form(0), pitch: int = Form(0),
+                mode: str = Form("manual"), api_key: str = Form(None)):
+        # Manual mode needs no Gemini key (edge-tts is free); auto mode
+        # splits voices by character with Gemini, so it needs a key.
         text = (text or "").strip()
         if not text:
             return JSONResponse(status_code=400, content={"error": "empty text"})
@@ -1078,11 +1254,14 @@ if os.environ.get("RENDER"):
             voice = "my-MM-NilarNeural"
         rate = max(-50, min(50, rate))
         pitch = max(-50, min(50, pitch))
+        if mode not in ("manual", "auto"):
+            mode = "manual"
         job_id = uuid.uuid4().hex
         with _jobs_lock:
             _jobs[job_id] = {"status": "pending"}
         _prune_jobs()
-        t = threading.Thread(target=_run_tts_job, args=(job_id, text, voice, rate, pitch),
+        t = threading.Thread(target=_run_tts_job,
+                             args=(job_id, text, voice, rate, pitch, mode, api_key),
                              daemon=True)
         t.start()
         return JSONResponse(status_code=202, content={"job_id": job_id})
@@ -1101,7 +1280,8 @@ if os.environ.get("RENDER"):
     @api_app.post("/api/voiceover")
     def api_voiceover(video: UploadFile = File(...), api_key: str = Form(None),
                       voice: str = Form("my-MM-NilarNeural"),
-                      rate: int = Form(0), pitch: int = Form(0)):
+                      rate: int = Form(0), pitch: int = Form(0),
+                      mode: str = Form("manual")):
         tmp = None
         try:
             suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
@@ -1116,12 +1296,14 @@ if os.environ.get("RENDER"):
                 voice = "my-MM-NilarNeural"
             rate = max(-50, min(50, rate))
             pitch = max(-50, min(50, pitch))
+            if mode not in ("manual", "auto"):
+                mode = "manual"
             job_id = uuid.uuid4().hex
             with _jobs_lock:
                 _jobs[job_id] = {"status": "pending"}
             _prune_jobs()
             t = threading.Thread(target=_run_voiceover_job,
-                                 args=(job_id, tmp.name, api_key, voice, rate, pitch),
+                                 args=(job_id, tmp.name, api_key, voice, rate, pitch, mode),
                                  daemon=True)
             t.start()
             return JSONResponse(status_code=202, content={"job_id": job_id})
