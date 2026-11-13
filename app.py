@@ -12,6 +12,7 @@
 # v7 (2026-11-13): Colab + Hugging Face Spaces နှစ်ခုလုံး အလုပ်ဖြစ်အောင် — env var Key, local ပုံများ, Spaces မှာ share ပိတ်။
 # v8 (2026-11-13): Render.com (အခမဲ့ အမြဲ link) ပါ အလုပ်ဖြစ်အောင် — RENDER env ရှိရင် 0.0.0.0:$PORT မှာ run, share ပိတ်, font install ကျော်။
 # v9 (2026-11-13): Render အခမဲ့ CPU မှာ မြန်အောင် — output ကို အရှည်ဆုံး ဘက် 1280 အထိ ချုံ့ + SRT ကို အရင် ပြခြင်း (video စောင့်နေစဉ် SRT ရပြီ)။
+# v10 (2026-11-13): Gemini call တစ်ခု ငြိမ်သွားရင် (read timeout) အလုပ်ရပ်မသွားအောင် — model တစ်ခုချင်းစီကို try/except နဲ့ ကာ + timeout 180s + နောက် model ကို အလိုလို ပြောင်းသုံးခြင်း။
 
 import glob
 import os
@@ -162,9 +163,15 @@ def transcribe_with_gemini(api_key, audio_path, duration):
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     for name in CANDIDATE_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
-        resp = requests.post(url, json=payload, headers=headers, timeout=300)
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=180)
+        except requests.exceptions.RequestException:
+            continue
         if resp.status_code == 200:
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
             cands = data.get("candidates", [])
             parts = cands[0].get("content", {}).get("parts", []) if cands else []
             texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
@@ -529,7 +536,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v9 (မြန်နှုန်း မြှင့်)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v10 (မြန်နှုန်း မြှင့်)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
