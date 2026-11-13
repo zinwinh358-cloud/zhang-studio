@@ -1017,6 +1017,66 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch):
     return out_mp4, srt_text
 
 
+# ---------------- Image + narration -> Video (v21) ----------------
+# သုံးစွဲသူက ပုံ တစ်ပုံ ထည့်ပြီး စာသား ရိုက်ထည့်ရုံနဲ့ Video တစ်ပုဒ် ထွက်တယ်:
+# ပုံ (ဖြည်းဖြည်း zoom-in) + မြန်မာ AI အသံ + မြန်မာစာတန်း burn-in။
+# အသံကို manual (အသံတစ်မျိုး) သို့မဟုတ် auto (ဇာတ်ကောင် အလိုက် ခွဲ) နဲ့ ထုတ်နိုင်တယ်။
+
+def build_narrated_image_video(workdir, img_path, text, voice, rate, pitch,
+                               mode, api_key):
+    """(image, text) -> (finished mp4 path, SRT text). The narration mp3 is
+    also left in the workdir as narration.mp3 for the /audio route."""
+    import shutil
+    font_path = find_myanmar_font()
+    if font_path is None:
+        raise RuntimeError("မြန်မာစာလုံး (font) မတွေ့ဘူး။")
+    if mode == "auto":
+        key = (api_key or "").strip() or SECRET_KEY
+        if not key:
+            raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+        try:
+            segments = split_voices(key, text)
+        except Exception:
+            segments = [(text, voice)]
+        out_mp3, _srt_path, srt_text, total, _n, tts_dir = \
+            synthesize_voiced_segments(segments, rate)
+    else:
+        out_mp3, _srt_path, srt_text, total, _n, tts_dir = synthesize_tts(
+            text, voice, rate, pitch)
+    narr_path = os.path.join(workdir, "narration.mp3")
+    shutil.copyfile(out_mp3, narr_path)
+    shutil.rmtree(tts_dir, ignore_errors=True)
+    cues = parse_srt_text(srt_text, total)
+    # Normalize any user image to vertical 576x1024 (cover crop) so the
+    # zoom math below always works, whatever shape the upload is.
+    norm_path = os.path.join(workdir, "image_norm.jpg")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", img_path, "-vf",
+         "scale=576:1024:force_original_aspect_ratio=increase,crop=576:1024",
+         "-frames:v", "1", norm_path],
+        capture_output=True, text=True, errors="ignore", timeout=300)
+    if r.returncode != 0 or not os.path.exists(norm_path):
+        raise RuntimeError("ပုံ ဖတ်လို့ မရဘူး။ JPG/PNG ပုံ ထည့်ပါ။")
+    dur = total + 0.8
+    frames = int(math.ceil(dur * 25))
+    dur = frames / 25.0
+    seg_path = os.path.join(workdir, "seg.mp4")
+    filt = ("[0:v]zoompan=z='min(zoom+0.0012,1.4)':x='iw/2-(iw/zoom/2)'"
+            f":y='ih/2-(ih/zoom/2)':d={frames}:s=576x1024:fps=25[v];[1:a]apad[a]")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", norm_path, "-i", narr_path,
+         "-filter_complex", filt,
+         "-map", "[v]", "-map", "[a]", "-t", f"{dur:.3f}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-c:a", "aac", "-b:a", "128k", seg_path],
+        capture_output=True, text=True, errors="ignore", timeout=900)
+    if r.returncode != 0 or not os.path.exists(seg_path):
+        raise RuntimeError("Video ထုတ်လို့ မရဘူး: " + r.stderr[-200:])
+    out_mp4 = os.path.join(workdir, "voiceover.mp4")
+    burn_subtitles(seg_path, cues, out_mp4, font_path)
+    return out_mp4, srt_text
+
+
 # ---------------- UI ----------------
 
 if SECRET_KEY:
@@ -1028,7 +1088,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v20 (auto voice split + TTS 15000 chars)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v21 (image narration + auto voice split)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1210,6 +1270,29 @@ if os.environ.get("RENDER"):
         with _jobs_lock:
             _jobs[job_id] = result
 
+    def _run_narrate_image_job(job_id, img_tmp_path, text, api_key,
+                               voice, rate, pitch, mode):
+        import shutil
+        workdir = tempfile.mkdtemp(prefix="narrate_image_")
+        try:
+            _out_mp4, srt_text = build_narrated_image_video(
+                workdir, img_tmp_path, text, voice, rate, pitch, mode, api_key)
+            result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio",
+                      "video_url": f"/api/download/{job_id}/video"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+            shutil.rmtree(workdir, ignore_errors=True)
+        finally:
+            try:
+                os.unlink(img_tmp_path)
+            except Exception:
+                pass
+        with _jobs_lock:
+            _jobs[job_id] = result
+
     @api_app.post("/api/transcribe")
     def api_transcribe(video: UploadFile = File(...), api_key: str = Form(None)):
         tmp = None
@@ -1338,6 +1421,52 @@ if os.environ.get("RENDER"):
                              daemon=True)
         t.start()
         return JSONResponse(status_code=202, content={"job_id": job_id})
+
+    @api_app.post("/api/narrate-image")
+    def api_narrate_image(image: UploadFile = File(...),
+                          text: str = Form(...), api_key: str = Form(None),
+                          voice: str = Form("my-MM-NilarNeural"),
+                          rate: int = Form(0), pitch: int = Form(0),
+                          mode: str = Form("manual")):
+        text = (text or "").strip()
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "empty text"})
+        if len(text) > 15000:
+            return JSONResponse(status_code=400,
+                                content={"error": "စာသား အရမ်းရှည်ပါတယ်။ အက္ခရာ 15000 ထက် မပိုအောင် လျှော့ပါ။"})
+        if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+            voice = "my-MM-NilarNeural"
+        rate = max(-50, min(50, rate))
+        pitch = max(-50, min(50, pitch))
+        if mode not in ("manual", "auto"):
+            mode = "manual"
+        tmp = None
+        try:
+            data = image.file.read()
+            if not data or len(data) > 15 * 1024 * 1024:
+                return JSONResponse(status_code=400,
+                                    content={"error": "ပုံ အရမ်းကြီးပါတယ်။ 15MB အောက် ထားပါ။"})
+            suffix = os.path.splitext(image.filename or "image.jpg")[1] or ".jpg"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(data)
+            tmp.close()
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_narrate_image_job,
+                                 args=(job_id, tmp.name, text, api_key,
+                                       voice, rate, pitch, mode),
+                                 daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
 
     @api_app.get("/api/download/{job_id}/video")
     def api_download_video(job_id: str):
