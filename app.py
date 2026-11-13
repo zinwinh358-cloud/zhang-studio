@@ -160,7 +160,9 @@ def transcribe_with_gemini(api_key, audio_path, duration):
         "Every cue must be meaningful Myanmar words a Myanmar viewer can understand. "
         "Do not summarize, do not add explanations. "
         "Return ONLY a valid SRT subtitle file: numbered cues, each with start --> end timestamps "
-        "in HH:MM:SS,mmm format. Use MANY SHORT cues: each cue at most 5 seconds, one short phrase "
+        "in HH:MM:SS,mmm format. Pay close attention to WHEN each phrase starts and ends — "
+        "the timestamps must match the speech exactly, not approximately. "
+        "Use MANY SHORT cues: each cue at most 5 seconds, one short phrase "
         "per cue, with the most accurate timestamps you can estimate. Never put a whole paragraph "
         "in one cue. If a word is unclear, write your best guess."
     )
@@ -355,6 +357,129 @@ def burn_subtitles(video_path, cues, out_path, font_path):
         raise RuntimeError("video ထဲ စာတန်း ထည့်လို့ မရဘူး: " + r.stderr[-300:])
 
 
+# ---------------- Exact timing (v18) ----------------
+# Gemini ရဲ့ timestamp တွေက ခန့်မှန်းချက်ပဲ ဖြစ်လို့ အချိန်လွဲနိုင်တယ်။
+# တိကျအောင်: (1) အသံတိတ်နေတဲ့ နေရာတွေမှာ အပိုင်းခွဲပြီး တစ်ပိုင်းစီ
+# သီးသန့် နားထောင်ခိုင်းတယ် (အပိုင်းတိုလေ timestamp တိကျလေ);
+# (2) အသံဆက်နေတဲ့ clip တွေအတွက် 6-စက္ကန့် ပြတင်းပေါက်တွေနဲ့ ခွဲတယ်;
+# (3) cue တွေရဲ့ အစ/အဆုံးကို အသံစတင်/ရပ်တဲ့ နေရာတွေနဲ့ ကပ်ပေးတယ်။
+# Chunk တစ်ခု မရရင် တစ်ခုလုံး နားထောင်တဲ့ နည်းလမ်း (အဟောင်း) ကို ပြန်သုံးတယ်။
+
+def detect_speech_segments(audio_path, duration):
+    """ffmpeg silencedetect -> speech intervals [(start, end)]."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-i", audio_path, "-af",
+             "silencedetect=noise=-35dB:d=0.5", "-f", "null", "-"],
+            capture_output=True, text=True, errors="ignore", timeout=300)
+    except Exception:
+        return []
+    silences = []
+    cur_start = None
+    for line in r.stderr.splitlines():
+        m = re.search(r"silence_start:\s*([0-9.]+)", line)
+        if m:
+            cur_start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*([0-9.]+)", line)
+        if m and cur_start is not None:
+            silences.append((cur_start, float(m.group(1))))
+            cur_start = None
+    if cur_start is not None:
+        silences.append((cur_start, duration))
+    segments = []
+    pos = 0.0
+    for s, e in silences:
+        if s > pos:
+            segments.append((pos, min(s, duration)))
+        pos = max(pos, e)
+    if pos < duration:
+        segments.append((pos, duration))
+    return [(s, e) for s, e in segments if e - s >= 0.3]
+
+
+def snap_cues_to_speech(cues, segments, duration, window=0.6):
+    """Snap each cue's start/end to the nearest speech-segment boundary
+    within `window` seconds (fixes subtitles appearing in silence)."""
+    if not segments or not cues:
+        return cues
+    starts = [s for s, _ in segments]
+    ends = [e for _, e in segments]
+    out = []
+    prev_end = 0.0
+    for start, end, text in cues:
+        ns = start
+        best = min(starts, key=lambda b: abs(b - start))
+        if abs(best - start) <= window:
+            ns = best
+        ne = end
+        best_e = min(ends, key=lambda b: abs(b - end))
+        if abs(best_e - end) <= window:
+            ne = best_e
+        ns = max(prev_end, min(ns, duration))
+        ne = max(ns + 0.2, min(ne, duration))
+        out.append((ns, ne, text))
+        prev_end = ne
+    return out
+
+
+def transcribe_cues(key, audio_path, duration, workdir):
+    """Audio -> (model name, cues) with tighter timestamps.
+    Chunked transcription for short clips (VAD segments, else 6s windows),
+    whole-audio fallback, then boundary snapping."""
+    segments = detect_speech_segments(audio_path, duration)
+    usable = [seg for seg in segments if seg[1] - seg[0] >= 0.8]
+    merged = []
+    for s, e in usable:
+        if merged and s - merged[-1][1] < 0.5:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    windows = None
+    if duration <= 90 and 1 < len(merged) <= 12:
+        windows = merged
+    elif duration <= 60:
+        # Continuous speech: fixed 6s windows (last one absorbs <2s tail).
+        windows = []
+        t = 0.0
+        while t < duration:
+            nxt = t + 6.0
+            if duration - nxt < 2.0:
+                nxt = duration
+            windows.append((t, nxt))
+            t = nxt
+        if len(windows) > 10:
+            windows = None
+    if windows:
+        try:
+            all_cues = []
+            model_name = None
+            for idx, (s, e) in enumerate(windows):
+                seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
+                seg_dur = e - s
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", audio_path,
+                     "-t", f"{seg_dur:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
+                     seg_path],
+                    capture_output=True, text=True, errors="ignore", timeout=300)
+                if r.returncode != 0 or not os.path.exists(seg_path):
+                    raise RuntimeError("segment extract failed")
+                m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
+                model_name = model_name or m
+                seg_cues = split_long_cues(split_long_cues(
+                    parse_srt_text(raw, seg_dur)))
+                for (cs, ce, t) in seg_cues:
+                    all_cues.append((cs + s, min(ce + s, duration), t))
+            if all_cues:
+                all_cues.sort(key=lambda c: c[0])
+                return model_name, snap_cues_to_speech(all_cues, segments, duration)
+        except Exception:
+            pass  # fall through to whole-audio below
+    model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
+    cues = split_long_cues(split_long_cues(parse_srt_text(raw_text, duration)))
+    return model_name, snap_cues_to_speech(cues, segments, duration)
+
+
 def transcribe_video_file(video_path, api_key=None):
     """Video file -> (model name, SRT text). Used by the /api/transcribe
     endpoint (Android app). Same pipeline as Tab 1, without the burn step:
@@ -372,10 +497,7 @@ def transcribe_video_file(video_path, api_key=None):
     if os.path.getsize(audio_path) > 15_000_000:
         raise RuntimeError("Video too long — try a clip under 10 minutes")
     _, _, duration = probe_video(video_path)
-    model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
-    cues = parse_srt_text(raw_text, duration)
-    cues = split_long_cues(cues)
-    cues = split_long_cues(cues)
+    model_name, cues = transcribe_cues(key, audio_path, duration, workdir)
     parts = []
     for k, (start, end, text) in enumerate(cues):
         parts.append(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{text}\n")
@@ -408,10 +530,7 @@ def process_subtitle(api_key, video):
             yield "⚠️ Video အရမ်းရှည်တယ် — ၁၀ မိနစ်အောက် clip နဲ့ စမ်းပါ။", "", None, None
             return
         _, _, duration = probe_video(video)
-        model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
-        cues = parse_srt_text(raw_text, duration)
-        cues = split_long_cues(cues)
-        cues = split_long_cues(cues)  # ဒုတိယအကြိမ် — ကျန်နေတဲ့ ရှည်တဲ့ cue တွေ ထပ်ခွဲ
+        model_name, cues = transcribe_cues(key, audio_path, duration, workdir)
         srt_path = os.path.join(workdir, f"{base}_burmese.srt")
         with open(srt_path, "w", encoding="utf-8") as f:
             for k, (start, end, text) in enumerate(cues):
@@ -586,6 +705,166 @@ def process_tts(text, voice_label, rate, pitch):
         return f"❌ Error: {e}", None, None, ""
 
 
+# ---------------- Prompt -> Video (v17) ----------------
+# Prompt တစ်ခု ရိုက်ထည့်ရုံနဲ့ Video တစ်ပုဒ် ထွက်တယ် (အခမဲ့ လမ်းကြောင်း):
+# 1) Gemini TEXT (free tier) က prompt ကို 3-scene ဇာတ်လမ်းတို ချဲ့ပေးတယ်
+#    (အင်္ဂလိပ် image prompt + မြန်မာ narration တစ်ပိုင်းစီ)
+# 2) ပုံတွေကို Pollinations အခမဲ့ image service က ထုတ်တယ် (Key မလိုဘူး) —
+#    Gemini image model တွေက billing-enabled key လိုတယ် (free tier quota = 0)
+#    ဆိုတာ 2026-11-13 မှာ အတည်ပြုပြီးသား၊ ဒါကြောင့် Gemini ပုံထုတ်တာ မသုံးဘူး
+# 3) edge-tts မြန်မာအသံ + ဖြည်းဖြည်း zoom-in လှုပ်ရှားမှု + မြန်မာစာတန်း burn-in
+
+def generate_script(api_key, prompt):
+    """User idea -> 3 scenes: [{"image_prompt": ..., "narration": ...}].
+    Raises RuntimeError on failure."""
+    import json
+    instruction = (
+        "You are a short-video scriptwriter. The user gives a video idea in any language. "
+        "Write a 3-scene short video script (each scene lasts 10 seconds). "
+        "For each scene give: 1) image_prompt: one detailed ENGLISH image-generation prompt "
+        "(cinematic, vertical 9:16) describing a single clear picture for the scene, keeping "
+        "the same main character and setting across all 3 scenes; "
+        "2) narration: 1-2 short sentences in Myanmar (Burmese) script that a narrator will "
+        "read aloud during the scene (about 8-12 words, natural spoken Myanmar). "
+        "The 3 scenes must tell one complete tiny story with a beginning, middle and end. "
+        "Return ONLY valid JSON: a list of exactly 3 objects with keys "
+        "\"image_prompt\" and \"narration\". No other text."
+    )
+    payload = {
+        "contents": [{"parts": [{"text": instruction + "\n\nIdea: " + prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
+    }
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    for name in CANDIDATE_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=120)
+        except requests.exceptions.RequestException:
+            continue
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
+            cands = data.get("candidates", [])
+            parts = cands[0].get("content", {}).get("parts", []) if cands else []
+            texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+            if not texts:
+                continue
+            raw = "\n".join(texts).strip()
+            scenes = None
+            try:
+                scenes = json.loads(raw)
+            except ValueError:
+                try:
+                    scenes = json.loads(re.sub(r"```\w*", "", raw).strip())
+                except ValueError:
+                    continue
+            if (isinstance(scenes, list) and len(scenes) == 3
+                    and all(isinstance(s, dict) and s.get("image_prompt")
+                            and s.get("narration") for s in scenes)):
+                return [{"image_prompt": str(s["image_prompt"]).strip(),
+                         "narration": str(s["narration"]).strip()} for s in scenes]
+            continue
+        if resp.status_code in (400, 404, 503, 429):
+            continue
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+    raise RuntimeError("ဇာတ်လမ်း ရေးလို့ မရဘူး။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ။")
+
+
+def fetch_scene_image(image_prompt, out_path, width=576, height=1024):
+    """Free image generation (Pollinations, no API key needed)."""
+    from urllib.parse import quote
+    url = ("https://image.pollinations.ai/prompt/" + quote(image_prompt)
+           + f"?width={width}&height={height}&nologo=true")
+    last_err = "unknown"
+    for _ in range(2):
+        try:
+            r = requests.get(url, timeout=150)
+            ctype = r.headers.get("content-type", "")
+            if r.status_code == 200 and ctype.startswith("image/") and len(r.content) > 10000:
+                with open(out_path, "wb") as f:
+                    f.write(r.content)
+                return
+            last_err = f"HTTP {r.status_code} ({ctype})"
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)[:100]
+    raise RuntimeError(f"ပုံ ထုတ်လို့ မရဘူး ({last_err})။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ။")
+
+
+def build_prompt_video(workdir, scenes, voice, rate, pitch):
+    """Scenes -> (finished mp4 path, SRT text).
+    Per scene: Myanmar narration (edge-tts) + slow zoom-in on the image
+    (10s minimum, longer if the narration needs it). Segments are joined
+    and the narration lines are burned in as Myanmar subtitles."""
+    import shutil
+    font_path = find_myanmar_font()
+    if font_path is None:
+        raise RuntimeError("မြန်မာစာလုံး (font) မတွေ့ဘူး။")
+    scene_files = []
+    all_cues = []
+    offset = 0.0
+    for i, scene in enumerate(scenes):
+        img_path = os.path.join(workdir, f"scene{i}.jpg")
+        fetch_scene_image(scene["image_prompt"], img_path)
+        out_mp3, _srt_path, srt_text, total, _n, tts_dir = synthesize_tts(
+            scene["narration"], voice, rate, pitch)
+        narr_path = os.path.join(workdir, f"narr{i}.mp3")
+        shutil.copyfile(out_mp3, narr_path)
+        shutil.rmtree(tts_dir, ignore_errors=True)
+        for (s, e, t) in parse_srt_text(srt_text, total):
+            all_cues.append((s + offset, e + offset, t))
+        dur = max(10.0, total + 0.8)
+        frames = int(math.ceil(dur * 25))
+        dur = frames / 25.0
+        seg_path = os.path.join(workdir, f"seg{i}.mp4")
+        filt = ("[0:v]zoompan=z='min(zoom+0.0012,1.4)':x='iw/2-(iw/zoom/2)'"
+                f":y='ih/2-(ih/zoom/2)':d={frames}:s=576x1024:fps=25[v];[1:a]apad[a]")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", img_path, "-i", narr_path,
+             "-filter_complex", filt,
+             "-map", "[v]", "-map", "[a]", "-t", f"{dur:.3f}",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k", seg_path],
+            capture_output=True, text=True, errors="ignore", timeout=900)
+        if r.returncode != 0 or not os.path.exists(seg_path):
+            raise RuntimeError("Video အပိုင်း ထုတ်လို့ မရဘူး: " + r.stderr[-200:])
+        scene_files.append(seg_path)
+        offset += dur
+    list_path = os.path.join(workdir, "segments.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for sf in scene_files:
+            f.write(f"file '{sf}'\n")
+    joined = os.path.join(workdir, "joined.mp4")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+         "-c", "copy", joined],
+        capture_output=True, text=True, errors="ignore", timeout=300)
+    if r.returncode != 0 or not os.path.exists(joined):
+        raise RuntimeError("Video အပိုင်းတွေ ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
+    out_mp4 = os.path.join(workdir, "voiceover.mp4")
+    burn_subtitles(joined, all_cues, out_mp4, font_path)
+    srt_text = ""
+    for k, (s, e, t) in enumerate(all_cues):
+        srt_text += f"{k + 1}\n{format_time(s)} --> {format_time(e)}\n{t}\n\n"
+    # Narration-only mp3 too (served by the /audio download route).
+    nlist = os.path.join(workdir, "narrs.txt")
+    with open(nlist, "w", encoding="utf-8") as f:
+        for i in range(len(scenes)):
+            f.write(f"file '{os.path.join(workdir, f'narr{i}.mp3')}'\n")
+    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", nlist,
+                    "-c:a", "libmp3lame", "-q:a", "4",
+                    os.path.join(workdir, "narration.mp3")],
+                   capture_output=True, text=True, errors="ignore", timeout=300)
+    return out_mp4, srt_text
+
+
 # ---------------- UI ----------------
 
 if SECRET_KEY:
@@ -597,7 +876,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v16 (voiceover API + TTS API)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v18 (exact timing + prompt-video API)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -639,6 +918,11 @@ with gr.Blocks(title="Zhang Studio") as demo:
 # audio_url ပါမယ် (GET /api/download/{job_id}/audio ကနေ mp3 ယူရမယ်)
 # v16: Voiceover လည်း async job — POST /api/voiceover → job_id → poll →
 # done မှာ video_url ပါမယ် (GET /api/download/{job_id}/video ကနေ mp4 ယူရမယ်)
+# v17: Prompt-to-video async job — POST /api/prompt-video → job_id → poll →
+# done မှာ video_url + srt ပါမယ် (ဇာတ်လမ်း Gemini TEXT, ပုံ Pollinations,
+# အသံ edge-tts, motion + စာတန်း ffmpeg)
+# v18: အချိန်တိကျအောင် chunked transcription (VAD အပိုင်း / 6s ပြတင်းပေါက်)
+# + cue အစ/အဆုံး အသံနဲ့ ကပ်ခြင်း — transcribe_cues() က Tab 1 ရော API ရော သုံးတယ်
 if os.environ.get("RENDER"):
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import FileResponse, JSONResponse
@@ -729,6 +1013,26 @@ if os.environ.get("RENDER"):
                 os.unlink(tmp_path)
             except Exception:
                 pass
+        with _jobs_lock:
+            _jobs[job_id] = result
+
+    def _run_prompt_video_job(job_id, prompt, api_key, voice, rate, pitch):
+        import shutil
+        workdir = tempfile.mkdtemp(prefix="prompt_video_")
+        try:
+            key = (api_key or "").strip() or SECRET_KEY
+            if not key:
+                raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+            scenes = generate_script(key, prompt)
+            _out_mp4, srt_text = build_prompt_video(workdir, scenes, voice, rate, pitch)
+            result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio",
+                      "video_url": f"/api/download/{job_id}/video"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+            shutil.rmtree(workdir, ignore_errors=True)
         with _jobs_lock:
             _jobs[job_id] = result
 
@@ -827,6 +1131,30 @@ if os.environ.get("RENDER"):
                 except Exception:
                     pass
             return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/prompt-video")
+    def api_prompt_video(prompt: str = Form(...), api_key: str = Form(None),
+                         voice: str = Form("my-MM-NilarNeural"),
+                         rate: int = Form(0), pitch: int = Form(0)):
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return JSONResponse(status_code=400, content={"error": "empty prompt"})
+        if len(prompt) > 1000:
+            return JSONResponse(status_code=400,
+                                content={"error": "prompt too long — keep it under 1000 characters"})
+        if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+            voice = "my-MM-NilarNeural"
+        rate = max(-50, min(50, rate))
+        pitch = max(-50, min(50, pitch))
+        job_id = uuid.uuid4().hex
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "pending"}
+        _prune_jobs()
+        t = threading.Thread(target=_run_prompt_video_job,
+                             args=(job_id, prompt, api_key, voice, rate, pitch),
+                             daemon=True)
+        t.start()
+        return JSONResponse(status_code=202, content={"job_id": job_id})
 
     @api_app.get("/api/download/{job_id}/video")
     def api_download_video(job_id: str):
