@@ -1010,14 +1010,20 @@ def generate_script(api_key, prompt):
     Raises RuntimeError on failure."""
     import json
     instruction = (
-        "You are a short-video scriptwriter. The user gives a video idea in any language. "
-        "Write a 3-scene short video script (each scene lasts 10 seconds). "
+        "You turn the user's text into a 3-scene video. The user's text is the script: "
+        "follow it EXACTLY. Never invent anything the user did not write. "
+        "Split the user's text into 3 parts in order; each scene shows ONLY what its part says. "
+        "If the text is a single short idea, show that same idea in 3 moments or angles, "
+        "adding no new characters, places or events. "
+        "STRICTLY FORBIDDEN unless the user explicitly wrote them: greetings or introductions "
+        "('hello everyone'), calls to action ('watch till the end', 'like and follow'), "
+        "new characters, romance, flirting, or any sexualized, suggestive or revealing imagery. "
         "For each scene give: 1) image_prompt: one detailed ENGLISH image-generation prompt "
-        "(cinematic, vertical 9:16) describing a single clear picture for the scene, keeping "
-        "the same main character and setting across all 3 scenes; "
-        "2) narration: 1-2 short sentences in Myanmar (Burmese) script that a narrator will "
-        "read aloud during the scene (about 8-12 words, natural spoken Myanmar). "
-        "The 3 scenes must tell one complete tiny story with a beginning, middle and end. "
+        "(cinematic, vertical 9:16) describing a single clear picture of ONLY what the scene's "
+        "text says. No people unless the text mentions people; any person shown must be fully "
+        "and modestly clothed. "
+        "2) narration: 1-2 SHORT sentences in Myanmar (Burmese) script, using the user's own "
+        "words as much as possible, retelling ONLY what the scene's text says (at most 30 words). "
         "Return ONLY valid JSON: a list of exactly 3 objects with keys "
         "\"image_prompt\" and \"narration\". No other text."
     )
@@ -1101,6 +1107,21 @@ def _normalize_scene_image(src_path, dst_path):
         raise RuntimeError("ပုံ ဖတ်လို့ မရဘူး။ JPG/PNG ပုံ ထည့်ပါ။")
 
 
+def _cap_narration(text, limit=200):
+    """Keep one scene's narration short so no scene balloons past ~10s
+    (edge-tts reads ~40 chars/sec). Cut at a sentence boundary when
+    possible; a hard cut only as a last resort."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for sep in ("။", ".", "!", "?", "\n"):
+        pos = cut.rfind(sep)
+        if pos >= 20:
+            return cut[:pos + len(sep)].strip()
+    return cut.strip()
+
+
 def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None):
     """Scenes -> (finished mp4 path, SRT text).
     Per scene: Myanmar narration (edge-tts) + slow zoom-in on the image
@@ -1134,7 +1155,7 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None):
                     raise
                 _normalize_scene_image(first, img_path)
         out_mp3, _srt_path, srt_text, total, _n, tts_dir = synthesize_tts(
-            scene["narration"], voice, rate, pitch)
+            _cap_narration(scene["narration"]), voice, rate, pitch)
         narr_path = os.path.join(workdir, f"narr{i}.mp3")
         shutil.copyfile(out_mp3, narr_path)
         shutil.rmtree(tts_dir, ignore_errors=True)
@@ -1381,7 +1402,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v26 (3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v27 (faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
