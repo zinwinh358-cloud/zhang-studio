@@ -876,7 +876,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v18 (exact timing + prompt-video API)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v19 (TTS 15000 chars + exact timing + prompt-video API)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1070,9 +1070,10 @@ if os.environ.get("RENDER"):
         text = (text or "").strip()
         if not text:
             return JSONResponse(status_code=400, content={"error": "empty text"})
-        if len(text) > 5000:
+        # v19: စာရှည်တွေ (ပုံပြင်အပြည့်အစုံ) လည်း ရအောင် 15000 အထိ ခွင့်ပြုသည်။
+        if len(text) > 15000:
             return JSONResponse(status_code=400,
-                                content={"error": "text too long — keep it under 5000 characters"})
+                                content={"error": "စာသား အရမ်းရှည်ပါတယ်။ အက္ခရာ 15000 ထက် မပိုအောင် လျှော့ပါ။"})
         if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
             voice = "my-MM-NilarNeural"
         rate = max(-50, min(50, rate))
