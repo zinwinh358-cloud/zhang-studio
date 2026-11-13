@@ -11,6 +11,7 @@
 # v6 (2026-11-13): မြန်အောင် — install ပြီးသားဆို ကျော်ခြင်း + encode ultrafast။
 # v7 (2026-11-13): Colab + Hugging Face Spaces နှစ်ခုလုံး အလုပ်ဖြစ်အောင် — env var Key, local ပုံများ, Spaces မှာ share ပိတ်။
 # v8 (2026-11-13): Render.com (အခမဲ့ အမြဲ link) ပါ အလုပ်ဖြစ်အောင် — RENDER env ရှိရင် 0.0.0.0:$PORT မှာ run, share ပိတ်, font install ကျော်။
+# v9 (2026-11-13): Render အခမဲ့ CPU မှာ မြန်အောင် — output ကို အရှည်ဆုံး ဘက် 1280 အထိ ချုံ့ + SRT ကို အရင် ပြခြင်း (video စောင့်နေစဉ် SRT ရပြီ)။
 
 import glob
 import os
@@ -296,18 +297,22 @@ def render_cue_png(text, w, h, font_path, font_size, out_path):
 
 def burn_subtitles(video_path, cues, out_path, font_path):
     w, h, duration = probe_video(video_path)
-    font_size = max(24, int(h * 0.045))
+    # Render အခမဲ့ CPU (0.1) မှာ မြန်အောင် — အရှည်ဆုံး ဘက်ကို 1280 အထိ ချုံ့မယ်။
+    scale = 1280 / max(w, h) if max(w, h) > 1280 else 1.0
+    sw = max(2, int(w * scale) // 2 * 2)
+    sh = max(2, int(h * scale) // 2 * 2)
+    font_size = max(24, int(sh * 0.045))
     tmpdir = tempfile.mkdtemp(prefix="cues_")
     pngs = []
     for k, (start, end, text) in enumerate(cues):
         p = os.path.join(tmpdir, f"cue_{k}.png")
-        render_cue_png(text, w, h, font_path, font_size, p)
+        render_cue_png(text, sw, sh, font_path, font_size, p)
         pngs.append((p, start, end))
     cmd = ["ffmpeg", "-y", "-i", video_path]
     for p, _, _ in pngs:
         cmd += ["-loop", "1", "-t", str(duration), "-i", p]
-    filt = ""
-    prev = "0:v"
+    filt = f"[0:v]scale={sw}:{sh}[base];"
+    prev = "base"
     for k, (_, start, end) in enumerate(pngs):
         out = f"v{k}"
         filt += f"[{prev}][{k + 1}:v]overlay=0:0:enable='between(t,{start:.3f},{end:.3f})'[{out}];"
@@ -322,14 +327,18 @@ def burn_subtitles(video_path, cues, out_path, font_path):
 
 
 def process_subtitle(api_key, video):
+    srt_text = ""
+    srt_path = None
     try:
         key = (api_key or "").strip() or SECRET_KEY
         if not key:
-            return "⚠️ Gemini API Key ထည့်ပါ (သို့) Secrets မှာ GEMINI_API_KEY သိမ်းပါ။", "", None, None
+            yield "⚠️ Gemini API Key ထည့်ပါ (သို့) Secrets မှာ GEMINI_API_KEY သိမ်းပါ။", "", None, None
+            return
         if isinstance(video, dict):
             video = video.get("path") or video.get("name")
         if not video or not os.path.exists(video):
-            return "⚠️ ဗီဒီယို တင်ပါ။", "", None, None
+            yield "⚠️ ဗီဒီယို တင်ပါ။", "", None, None
+            return
         workdir = tempfile.mkdtemp(prefix="subtitle_app_")
         base = os.path.splitext(os.path.basename(video))[0]
         audio_path = os.path.join(workdir, "audio.mp3")
@@ -337,9 +346,11 @@ def process_subtitle(api_key, video):
                             "-c:a", "libmp3lame", "-q:a", "4", audio_path],
                            capture_output=True, text=True, errors="ignore", timeout=600)
         if r.returncode != 0 or not os.path.exists(audio_path):
-            return "❌ အသံ ထုတ်လို့ မရဘူး။ video မှာ အသံပါလား စစ်ပါ။", "", None, None
+            yield "❌ အသံ ထုတ်လို့ မရဘူး။ video မှာ အသံပါလား စစ်ပါ။", "", None, None
+            return
         if os.path.getsize(audio_path) > 15_000_000:
-            return "⚠️ Video အရမ်းရှည်တယ် — ၁၀ မိနစ်အောက် clip နဲ့ စမ်းပါ။", "", None, None
+            yield "⚠️ Video အရမ်းရှည်တယ် — ၁၀ မိနစ်အောက် clip နဲ့ စမ်းပါ။", "", None, None
+            return
         _, _, duration = probe_video(video)
         model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
         cues = parse_srt_text(raw_text, duration)
@@ -351,15 +362,17 @@ def process_subtitle(api_key, video):
                 f.write(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{text}\n\n")
         with open(srt_path, encoding="utf-8") as f:
             srt_text = f.read()
+        yield f"⏳ စာတန်း ရပြီ (model: {model_name}) — video ထဲ ထည့်နေတယ်…", srt_text, None, srt_path
         font_path = find_myanmar_font()
         if font_path is None:
-            return "⚠️ မြန်မာစာလုံး (font) ရှာမတွေ့ဘူး။ Cell ကို ပြန် run ပါ။", srt_text, None, srt_path
+            yield "⚠️ မြန်မာစာလုံး (font) ရှာမတွေ့ဘူး။ Cell ကို ပြန် run ပါ။", srt_text, None, srt_path
+            return
         out_video = os.path.join(workdir, f"{base}_subtitled.mp4")
         burn_subtitles(video, cues, out_video, font_path)
         status = f"✅ ပြီးပါပြီ။ model: {model_name} — စာတန်း {len(cues)} ပိုင်း။"
-        return status, srt_text, out_video, srt_path
+        yield status, srt_text, out_video, srt_path
     except Exception as e:
-        return f"❌ Error: {e}", "", None, None
+        yield f"❌ Error: {e}", srt_text, None, srt_path
 
 
 # ---------------- Tab 2: စာရိုက် → အသံဖတ်ပြ + စာတန်း ----------------
@@ -516,7 +529,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v9 (မြန်နှုန်း မြှင့်)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
