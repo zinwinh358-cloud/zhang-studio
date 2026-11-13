@@ -14,6 +14,7 @@
 # v9 (2026-11-13): Render အခမဲ့ CPU မှာ မြန်အောင် — output ကို အရှည်ဆုံး ဘက် 1280 အထိ ချုံ့ + SRT ကို အရင် ပြခြင်း (video စောင့်နေစဉ် SRT ရပြီ)။
 # v10 (2026-11-13): Gemini call တစ်ခု ငြိမ်သွားရင် (read timeout) အလုပ်ရပ်မသွားအောင် — model တစ်ခုချင်းစီကို try/except နဲ့ ကာ + timeout 180s + နောက် model ကို အလိုလို ပြောင်းသုံးခြင်း။
 # v11 (2026-11-13): Burn မြန်အောင် — cue PNG တွေကို frame အပြည့် အစား အောက်ခြေ band လေးပဲ ဆွဲခြင်း (overlay=0:<y>) + gemini-3.6-flash ကို ပထမ model အဖြစ် ထားခြင်း (3.8-flash 2 ခါ ငြိမ်သွားလို့)။
+# v12 (2026-11-13): ဘာသာပြန် — မြန်မာစကား မဟုတ်ရင် အသံကို အဓိပ္ပာယ် ဘာသာပြန်ပြီး မြန်မာစာတန်း ထုတ်ခြင်း (အသံထွက် အတိုင်း မြန်မာစာလုံးနဲ့ ရေးခြင်း လုံးဝ မလုပ်ရ)။
 
 import glob
 import os
@@ -145,8 +146,15 @@ def transcribe_with_gemini(api_key, audio_path, duration):
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
     prompt = (
-        "The audio is in Burmese (Myanmar language). Transcribe EXACTLY what is said, word for word, "
-        "in Myanmar (Burmese) script. Do not translate, do not summarize, do not add explanations. "
+        "Listen to this audio. First detect the spoken language. "
+        "If the speech is in Myanmar (Burmese), transcribe EXACTLY what is said, word for word, "
+        "in Myanmar script. "
+        "If the speech is in ANY other language (Chinese, Thai, English, Indonesian, Korean, or any "
+        "other), TRANSLATE the meaning into natural, fluent Myanmar (Burmese) language — translate "
+        "the MEANING, not the sounds. "
+        "NEVER write foreign-language sounds phonetically in Myanmar script (no transliteration). "
+        "Every cue must be meaningful Myanmar words a Myanmar viewer can understand. "
+        "Do not summarize, do not add explanations. "
         "Return ONLY a valid SRT subtitle file: numbered cues, each with start --> end timestamps "
         "in HH:MM:SS,mmm format. Use MANY SHORT cues: each cue at most 5 seconds, one short phrase "
         "per cue, with the most accurate timestamps you can estimate. Never put a whole paragraph "
@@ -341,6 +349,33 @@ def burn_subtitles(video_path, cues, out_path, font_path):
     r = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=1800)
     if r.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError("video ထဲ စာတန်း ထည့်လို့ မရဘူး: " + r.stderr[-300:])
+
+
+def transcribe_video_file(video_path, api_key=None):
+    """Video file -> (model name, SRT text). Used by the /api/transcribe
+    endpoint (Android app). Same pipeline as Tab 1, without the burn step:
+    extract audio -> Gemini transcribe/translate -> parse -> short cues."""
+    key = (api_key or "").strip() or SECRET_KEY
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not configured on the server")
+    workdir = tempfile.mkdtemp(prefix="api_transcribe_")
+    audio_path = os.path.join(workdir, "audio.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
+                        "-c:a", "libmp3lame", "-q:a", "4", audio_path],
+                       capture_output=True, text=True, errors="ignore", timeout=600)
+    if r.returncode != 0 or not os.path.exists(audio_path):
+        raise RuntimeError("Could not extract audio — does the video have sound?")
+    if os.path.getsize(audio_path) > 15_000_000:
+        raise RuntimeError("Video too long — try a clip under 10 minutes")
+    _, _, duration = probe_video(video_path)
+    model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
+    cues = parse_srt_text(raw_text, duration)
+    cues = split_long_cues(cues)
+    cues = split_long_cues(cues)
+    parts = []
+    for k, (start, end, text) in enumerate(cues):
+        parts.append(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{text}\n")
+    return model_name, "\n".join(parts)
 
 
 def process_subtitle(api_key, video):
@@ -546,7 +581,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v11 (မြန်နှုန်း မြှင့်)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v13 (API + ဘာသာပြန်)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -579,12 +614,41 @@ with gr.Blocks(title="Zhang Studio") as demo:
                    outputs=[status2, audio_out, file_out2, srt_out2])
 
 # Spaces/Render မှာ share မလိုဘူး (အမြဲ link ရှိပြီးသား); Colab မှာ share လိုတယ်
-# Render: RENDER=true + PORT env ပါတယ် — 0.0.0.0:$PORT မှာ run ရမယ်
-_launch_kwargs = {"favicon_path": FAVICON_PATH}
+# Render: RENDER=true + PORT env ပါတယ် — Gradio UI + Android API (/api/transcribe)
+# ကို port တစ်ခုတည်းမှာ FastAPI mount လုပ်ပြီး run ရမယ်
 if os.environ.get("RENDER"):
-    _launch_kwargs.update({"server_name": "0.0.0.0",
-                           "server_port": int(os.environ.get("PORT", "7860")),
-                           "share": False})
+    from fastapi import FastAPI, File, UploadFile
+    from fastapi.responses import JSONResponse
+    import uvicorn
+
+    api_app = FastAPI()
+
+    @api_app.post("/api/transcribe")
+    def api_transcribe(video: UploadFile = File(...)):
+        tmp = None
+        try:
+            suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            while True:
+                chunk = video.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp.close()
+            model_name, srt_text = transcribe_video_file(tmp.name, None)
+            return {"srt": srt_text, "model": model_name}
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+
+    app = gr.mount_gradio_app(api_app, demo, path="/")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "7860")))
 else:
+    _launch_kwargs = {"favicon_path": FAVICON_PATH}
     _launch_kwargs["share"] = not bool(os.environ.get("SPACE_ID"))
-demo.launch(**_launch_kwargs)
+    demo.launch(**_launch_kwargs)
