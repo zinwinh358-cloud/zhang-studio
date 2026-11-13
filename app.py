@@ -1089,11 +1089,29 @@ def fetch_scene_image(image_prompt, out_path, width=576, height=1024):
     raise RuntimeError(f"ပုံ ထုတ်လို့ မရဘူး ({last_err})။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ။")
 
 
-def build_prompt_video(workdir, scenes, voice, rate, pitch):
+def _normalize_scene_image(src_path, dst_path):
+    """Any user image -> vertical 576x1024 (cover crop) so the zoom math
+    always works, whatever shape the upload is."""
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", src_path, "-vf",
+         "scale=576:1024:force_original_aspect_ratio=increase,crop=576:1024",
+         "-frames:v", "1", dst_path],
+        capture_output=True, text=True, errors="ignore", timeout=300)
+    if r.returncode != 0 or not os.path.exists(dst_path):
+        raise RuntimeError("ပုံ ဖတ်လို့ မရဘူး။ JPG/PNG ပုံ ထည့်ပါ။")
+
+
+def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None):
     """Scenes -> (finished mp4 path, SRT text).
     Per scene: Myanmar narration (edge-tts) + slow zoom-in on the image
     (10s minimum, longer if the narration needs it). Segments are joined
-    and the narration lines are burned in as Myanmar subtitles."""
+    and the narration lines are burned in as Myanmar subtitles.
+    v25/v26: scene_images[i] (user-supplied image) replaces the generated
+    picture for that scene. If the free image service fails for a scene
+    and the user supplied at least one image, the first supplied image is
+    reused so the job still completes (Pollinations returns HTTP 402 from
+    Render's shared IP, though it answers 200 elsewhere — verified
+    2026-11-13)."""
     import shutil
     font_path = find_myanmar_font()
     if font_path is None:
@@ -1103,7 +1121,18 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch):
     offset = 0.0
     for i, scene in enumerate(scenes):
         img_path = os.path.join(workdir, f"scene{i}.jpg")
-        fetch_scene_image(scene["image_prompt"], img_path)
+        supplied = (scene_images[i] if scene_images and i < len(scene_images)
+                    else None)
+        if supplied:
+            _normalize_scene_image(supplied, img_path)
+        else:
+            try:
+                fetch_scene_image(scene["image_prompt"], img_path)
+            except Exception:
+                first = next((p for p in (scene_images or []) if p), None)
+                if not first:
+                    raise
+                _normalize_scene_image(first, img_path)
         out_mp3, _srt_path, srt_text, total, _n, tts_dir = synthesize_tts(
             scene["narration"], voice, rate, pitch)
         narr_path = os.path.join(workdir, f"narr{i}.mp3")
@@ -1352,7 +1381,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v24 (timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v26 (3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1543,7 +1572,8 @@ if os.environ.get("RENDER"):
         with _jobs_lock:
             _jobs[job_id] = result
 
-    def _run_prompt_video_job(job_id, prompt, api_key, voice, rate, pitch):
+    def _run_prompt_video_job(job_id, prompt, api_key, voice, rate, pitch,
+                              img_tmp_paths=None):
         import shutil
         workdir = tempfile.mkdtemp(prefix="prompt_video_")
         try:
@@ -1551,7 +1581,8 @@ if os.environ.get("RENDER"):
             if not key:
                 raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
             scenes = generate_script(key, prompt)
-            _out_mp4, srt_text = build_prompt_video(workdir, scenes, voice, rate, pitch)
+            _out_mp4, srt_text = build_prompt_video(
+                workdir, scenes, voice, rate, pitch, img_tmp_paths)
             result = {"status": "done", "srt": srt_text,
                       "audio_url": f"/api/download/{job_id}/audio",
                       "video_url": f"/api/download/{job_id}/video"}
@@ -1560,6 +1591,13 @@ if os.environ.get("RENDER"):
         except Exception as e:
             result = {"status": "error", "error": str(e)}
             shutil.rmtree(workdir, ignore_errors=True)
+        finally:
+            for p in (img_tmp_paths or []):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
         with _jobs_lock:
             _jobs[job_id] = result
 
@@ -1736,7 +1774,10 @@ if os.environ.get("RENDER"):
     @api_app.post("/api/prompt-video")
     def api_prompt_video(prompt: str = Form(...), api_key: str = Form(None),
                          voice: str = Form("my-MM-NilarNeural"),
-                         rate: int = Form(0), pitch: int = Form(0)):
+                         rate: int = Form(0), pitch: int = Form(0),
+                         image1: UploadFile = File(None),
+                         image2: UploadFile = File(None),
+                         image3: UploadFile = File(None)):
         prompt = (prompt or "").strip()
         if not prompt:
             return JSONResponse(status_code=400, content={"error": "empty prompt"})
@@ -1747,15 +1788,40 @@ if os.environ.get("RENDER"):
             voice = "my-MM-NilarNeural"
         rate = max(-50, min(50, rate))
         pitch = max(-50, min(50, pitch))
-        job_id = uuid.uuid4().hex
-        with _jobs_lock:
-            _jobs[job_id] = {"status": "pending"}
-        _prune_jobs()
-        t = threading.Thread(target=_run_prompt_video_job,
-                             args=(job_id, prompt, api_key, voice, rate, pitch),
-                             daemon=True)
-        t.start()
-        return JSONResponse(status_code=202, content={"job_id": job_id})
+        tmps = []
+        try:
+            img_paths = []
+            for image in (image1, image2, image3):
+                if image is None or not image.filename:
+                    img_paths.append(None)
+                    continue
+                data = image.file.read()
+                if not data or len(data) > 15 * 1024 * 1024:
+                    return JSONResponse(status_code=400,
+                                        content={"error": "ပုံ အရမ်းကြီးပါတယ်။ 15MB အောက် ထားပါ။"})
+                suffix = os.path.splitext(image.filename or "image.jpg")[1] or ".jpg"
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                tmp.write(data)
+                tmp.close()
+                tmps.append(tmp)
+                img_paths.append(tmp.name)
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_prompt_video_job,
+                                 args=(job_id, prompt, api_key, voice, rate, pitch,
+                                       img_paths),
+                                 daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
+            for tmp in tmps:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
 
     @api_app.post("/api/narrate-image")
     def api_narrate_image(image: UploadFile = File(...),
