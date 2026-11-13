@@ -15,6 +15,10 @@
 # v10 (2026-11-13): Gemini call တစ်ခု ငြိမ်သွားရင် (read timeout) အလုပ်ရပ်မသွားအောင် — model တစ်ခုချင်းစီကို try/except နဲ့ ကာ + timeout 180s + နောက် model ကို အလိုလို ပြောင်းသုံးခြင်း။
 # v11 (2026-11-13): Burn မြန်အောင် — cue PNG တွေကို frame အပြည့် အစား အောက်ခြေ band လေးပဲ ဆွဲခြင်း (overlay=0:<y>) + gemini-3.6-flash ကို ပထမ model အဖြစ် ထားခြင်း (3.8-flash 2 ခါ ငြိမ်သွားလို့)။
 # v12 (2026-11-13): ဘာသာပြန် — မြန်မာစကား မဟုတ်ရင် အသံကို အဓိပ္ပာယ် ဘာသာပြန်ပြီး မြန်မာစာတန်း ထုတ်ခြင်း (အသံထွက် အတိုင်း မြန်မာစာလုံးနဲ့ ရေးခြင်း လုံးဝ မလုပ်ရ)။
+# v13 (2026-11-13): Android API — POST /api/transcribe (video → SRT, sync)။
+# v14 (2026-11-13): async jobs — /api/transcribe က job_id ပြန်ပေးပြီး /api/status/{job_id} ကို poll လုပ်ခြင်း + ကိုယ့် API Key ထည့်သုံးနိုင်ခြင်း။
+# v15 (2026-11-13): TTS API — POST /api/tts (စာသား → AI အသံ + SRT, async) + GET /api/download/{job_id}/audio။
+# v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
 
 import glob
 import os
@@ -521,50 +525,62 @@ def build_tts_cues(text, bounds, total_duration):
     return cues
 
 
+def synthesize_tts(text, voice, rate, pitch):
+    """Text -> (mp3 path, SRT path, SRT text, total seconds, cue count, workdir).
+    Shared by the Gradio Tab 2 UI and the /api/tts endpoint (Android app).
+    Raises on failure; the caller formats the error for its own UI.
+    `voice` is an edge-tts voice id (my-MM-NilarNeural / my-MM-ThihaNeural);
+    `rate`/`pitch` are ints in [-50, 50]. The workdir is left on disk so the
+    API can serve the mp3 afterwards; the job-pruning code deletes it."""
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("စာသား ရိုက်ထည့်ပါ။")
+    rate_str = f"{int(rate):+d}%"
+    pitch_str = f"{int(pitch):+d}Hz"
+    workdir = tempfile.mkdtemp(prefix="tts_app_")
+    chunks = chunk_text(text)
+    chunk_files = []
+    all_bounds = []
+    shift = 0.0
+    for i, ch in enumerate(chunks):
+        audio, bounds = edge_synthesize(ch, voice, rate_str, pitch_str)
+        if not audio:
+            raise RuntimeError("အသံ ထုတ်လို့ မရဘူး။ ထပ်စမ်းကြည့်ပါ။")
+        cf = os.path.join(workdir, f"part{i}.mp3")
+        with open(cf, "wb") as f:
+            f.write(audio)
+        chunk_files.append(cf)
+        dur = probe_duration(cf)
+        for (s, e, w) in bounds:
+            all_bounds.append((s + shift, e + shift, w))
+        shift += dur
+    list_path = os.path.join(workdir, "parts.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for cf in chunk_files:
+            f.write(f"file '{cf}'\n")
+    out_mp3 = os.path.join(workdir, "narration.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                        "-c:a", "libmp3lame", "-q:a", "4", out_mp3],
+                       capture_output=True, text=True, errors="ignore", timeout=600)
+    if r.returncode != 0 or not os.path.exists(out_mp3):
+        raise RuntimeError("အသံဖိုင် ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
+    total = probe_duration(out_mp3)
+    cues = build_tts_cues(text, all_bounds, total)
+    srt_path = os.path.join(workdir, "narration.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for k, (start, end, s) in enumerate(cues):
+            f.write(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{s}\n\n")
+    with open(srt_path, encoding="utf-8") as f:
+        srt_text = f.read()
+    return out_mp3, srt_path, srt_text, total, len(cues), workdir
+
+
 def process_tts(text, voice_label, rate, pitch):
     try:
-        text = (text or "").strip()
-        if not text:
-            return "⚠️ စာသား ရိုက်ထည့်ပါ။", None, None, ""
         voice = VOICES.get(voice_label, "my-MM-NilarNeural")
-        rate_str = f"{int(rate):+d}%"
-        pitch_str = f"{int(pitch):+d}Hz"
-        workdir = tempfile.mkdtemp(prefix="tts_app_")
-        chunks = chunk_text(text)
-        chunk_files = []
-        all_bounds = []
-        shift = 0.0
-        for i, ch in enumerate(chunks):
-            audio, bounds = edge_synthesize(ch, voice, rate_str, pitch_str)
-            if not audio:
-                raise RuntimeError("အသံ ထုတ်လို့ မရဘူး။ ထပ်စမ်းကြည့်ပါ။")
-            cf = os.path.join(workdir, f"part{i}.mp3")
-            with open(cf, "wb") as f:
-                f.write(audio)
-            chunk_files.append(cf)
-            dur = probe_duration(cf)
-            for (s, e, w) in bounds:
-                all_bounds.append((s + shift, e + shift, w))
-            shift += dur
-        list_path = os.path.join(workdir, "parts.txt")
-        with open(list_path, "w", encoding="utf-8") as f:
-            for cf in chunk_files:
-                f.write(f"file '{cf}'\n")
-        out_mp3 = os.path.join(workdir, "narration.mp3")
-        r = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-                            "-c:a", "libmp3lame", "-q:a", "4", out_mp3],
-                           capture_output=True, text=True, errors="ignore", timeout=600)
-        if r.returncode != 0 or not os.path.exists(out_mp3):
-            raise RuntimeError("အသံဖိုင် ပေါင်းလို့ မရဘူး: " + r.stderr[-200:])
-        total = probe_duration(out_mp3)
-        cues = build_tts_cues(text, all_bounds, total)
-        srt_path = os.path.join(workdir, "narration.srt")
-        with open(srt_path, "w", encoding="utf-8") as f:
-            for k, (start, end, s) in enumerate(cues):
-                f.write(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{s}\n\n")
-        with open(srt_path, encoding="utf-8") as f:
-            srt_text = f.read()
-        status = f"✅ ပြီးပါပြီ။ အသံ {total:.1f} စက္ကန့် — စာတန်း {len(cues)} ပိုင်း။"
+        out_mp3, srt_path, srt_text, total, n_cues, _workdir = synthesize_tts(
+            text, voice, rate, pitch)
+        status = f"✅ ပြီးပါပြီ။ အသံ {total:.1f} စက္ကန့် — စာတန်း {n_cues} ပိုင်း။"
         return status, out_mp3, srt_path, srt_text
     except Exception as e:
         return f"❌ Error: {e}", None, None, ""
@@ -581,7 +597,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v13 (API + ဘာသာပြန်)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v16 (voiceover API + TTS API)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -616,15 +632,108 @@ with gr.Blocks(title="Zhang Studio") as demo:
 # Spaces/Render မှာ share မလိုဘူး (အမြဲ link ရှိပြီးသား); Colab မှာ share လိုတယ်
 # Render: RENDER=true + PORT env ပါတယ် — Gradio UI + Android API (/api/transcribe)
 # ကို port တစ်ခုတည်းမှာ FastAPI mount လုပ်ပြီး run ရမယ်
+# v14: transcription က async job — client က upload တင်တာနဲ့ job_id ရမယ်,
+# server က နောက်ကွယ်မှာ လုပ်မယ်, client က /api/status/{job_id} ကို ခဏခဏ
+# မေးမယ် (slow connection မှာ timeout မဖြစ်အောင်)
+# v15: TTS လည်း async job ပဲ — POST /api/tts → job_id → poll → done မှာ
+# audio_url ပါမယ် (GET /api/download/{job_id}/audio ကနေ mp3 ယူရမယ်)
+# v16: Voiceover လည်း async job — POST /api/voiceover → job_id → poll →
+# done မှာ video_url ပါမယ် (GET /api/download/{job_id}/video ကနေ mp4 ယူရမယ်)
 if os.environ.get("RENDER"):
-    from fastapi import FastAPI, File, UploadFile
-    from fastapi.responses import JSONResponse
+    from fastapi import FastAPI, File, Form, UploadFile
+    from fastapi.responses import FileResponse, JSONResponse
+    import shutil
+    import threading
+    import uuid
     import uvicorn
 
     api_app = FastAPI()
+    _jobs = {}
+    _job_files = {}  # job_id -> workdir holding the finished TTS mp3
+    _jobs_lock = threading.Lock()
+
+    def _prune_jobs():
+        # Keep the job table small: drop oldest finished jobs (and delete
+        # their TTS workdirs so mp3 files don't pile up on disk).
+        # Called OUTSIDE _jobs_lock (threading.Lock is not reentrant).
+        with _jobs_lock:
+            if len(_jobs) <= 50:
+                return
+            finished = [k for k, v in _jobs.items() if v.get("status") != "pending"]
+            for k in finished[: len(_jobs) - 50]:
+                del _jobs[k]
+                workdir = _job_files.pop(k, None)
+                if workdir:
+                    shutil.rmtree(workdir, ignore_errors=True)
+
+    def _run_job(job_id, tmp_path, api_key):
+        try:
+            model_name, srt_text = transcribe_video_file(tmp_path, api_key)
+            result = {"status": "done", "srt": srt_text, "model": model_name}
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        with _jobs_lock:
+            _jobs[job_id] = result
+
+    def _run_tts_job(job_id, text, voice, rate, pitch):
+        try:
+            out_mp3, _srt_path, srt_text, _total, _n, workdir = synthesize_tts(
+                text, voice, rate, pitch)
+            result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+        with _jobs_lock:
+            _jobs[job_id] = result
+
+    def _run_voiceover_job(job_id, tmp_path, api_key, voice, rate, pitch):
+        try:
+            _model_name, srt_text = transcribe_video_file(tmp_path, api_key)
+            # Narration text = the transcribed/translated lines in order.
+            narration = " ".join(
+                line.strip()
+                for line in srt_text.splitlines()
+                if line.strip() and "-->" not in line and not line.strip().isdigit()
+            ).strip()
+            if not narration:
+                raise RuntimeError("ဒီ Video မှာ အသံမတွေ့ဘူး။")
+            out_mp3, _srt_path, tts_srt, _total, _n, workdir = synthesize_tts(
+                narration, voice, rate, pitch)
+            out_mp4 = os.path.join(workdir, "voiceover.mp4")
+            # Video stream copied (no re-encode = fast); narration becomes
+            # the audio track. Original audio is replaced so the old
+            # language doesn't clash with the Myanmar narration.
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_path, "-i", out_mp3,
+                 "-map", "0:v:0", "-map", "1:a:0",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", out_mp4],
+                capture_output=True, text=True, errors="ignore", timeout=600)
+            if r.returncode != 0 or not os.path.exists(out_mp4):
+                raise RuntimeError("Video နဲ့ အသံ တွဲလို့ မရဘူး: " + r.stderr[-200:])
+            result = {"status": "done", "srt": tts_srt,
+                      "audio_url": f"/api/download/{job_id}/audio",
+                      "video_url": f"/api/download/{job_id}/video"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        with _jobs_lock:
+            _jobs[job_id] = result
 
     @api_app.post("/api/transcribe")
-    def api_transcribe(video: UploadFile = File(...)):
+    def api_transcribe(video: UploadFile = File(...), api_key: str = Form(None)):
         tmp = None
         try:
             suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
@@ -635,16 +744,108 @@ if os.environ.get("RENDER"):
                     break
                 tmp.write(chunk)
             tmp.close()
-            model_name, srt_text = transcribe_video_file(tmp.name, None)
-            return {"srt": srt_text, "model": model_name}
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_job, args=(job_id, tmp.name, api_key), daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
         except Exception as e:
-            return JSONResponse(status_code=500, content={"error": str(e)})
-        finally:
             if tmp is not None:
                 try:
                     os.unlink(tmp.name)
                 except Exception:
                     pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/tts")
+    def api_tts(text: str = Form(...), voice: str = Form("my-MM-NilarNeural"),
+                rate: int = Form(0), pitch: int = Form(0)):
+        # No Gemini key needed: edge-tts is a free voice service.
+        text = (text or "").strip()
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "empty text"})
+        if len(text) > 5000:
+            return JSONResponse(status_code=400,
+                                content={"error": "text too long — keep it under 5000 characters"})
+        if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+            voice = "my-MM-NilarNeural"
+        rate = max(-50, min(50, rate))
+        pitch = max(-50, min(50, pitch))
+        job_id = uuid.uuid4().hex
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "pending"}
+        _prune_jobs()
+        t = threading.Thread(target=_run_tts_job, args=(job_id, text, voice, rate, pitch),
+                             daemon=True)
+        t.start()
+        return JSONResponse(status_code=202, content={"job_id": job_id})
+
+    @api_app.get("/api/download/{job_id}/audio")
+    def api_download_audio(job_id: str):
+        with _jobs_lock:
+            workdir = _job_files.get(job_id)
+        if not workdir:
+            return JSONResponse(status_code=404, content={"error": "unknown job"})
+        mp3_path = os.path.join(workdir, "narration.mp3")
+        if not os.path.exists(mp3_path):
+            return JSONResponse(status_code=404, content={"error": "audio not ready"})
+        return FileResponse(mp3_path, media_type="audio/mpeg", filename="narration.mp3")
+
+    @api_app.post("/api/voiceover")
+    def api_voiceover(video: UploadFile = File(...), api_key: str = Form(None),
+                      voice: str = Form("my-MM-NilarNeural"),
+                      rate: int = Form(0), pitch: int = Form(0)):
+        tmp = None
+        try:
+            suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            while True:
+                chunk = video.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp.close()
+            if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+                voice = "my-MM-NilarNeural"
+            rate = max(-50, min(50, rate))
+            pitch = max(-50, min(50, pitch))
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_voiceover_job,
+                                 args=(job_id, tmp.name, api_key, voice, rate, pitch),
+                                 daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.get("/api/download/{job_id}/video")
+    def api_download_video(job_id: str):
+        with _jobs_lock:
+            workdir = _job_files.get(job_id)
+        if not workdir:
+            return JSONResponse(status_code=404, content={"error": "unknown job"})
+        mp4_path = os.path.join(workdir, "voiceover.mp4")
+        if not os.path.exists(mp4_path):
+            return JSONResponse(status_code=404, content={"error": "video not ready"})
+        return FileResponse(mp4_path, media_type="video/mp4", filename="voiceover.mp4")
+
+    @api_app.get("/api/status/{job_id}")
+    def api_status(job_id: str):
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content={"error": "unknown job"})
+        return dict(job)
 
     app = gr.mount_gradio_app(api_app, demo, path="/")
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "7860")))
