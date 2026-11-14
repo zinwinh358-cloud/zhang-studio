@@ -19,6 +19,7 @@
 # v14 (2026-11-13): async jobs — /api/transcribe က job_id ပြန်ပေးပြီး /api/status/{job_id} ကို poll လုပ်ခြင်း + ကိုယ့် API Key ထည့်သုံးနိုင်ခြင်း။
 # v15 (2026-11-13): TTS API — POST /api/tts (စာသား → AI အသံ + SRT, async) + GET /api/download/{job_id}/audio။
 # v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
+# v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
 
 import glob
 import os
@@ -1122,7 +1123,8 @@ def _cap_narration(text, limit=200):
     return cut.strip()
 
 
-def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None):
+def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None,
+                       mode="manual", api_key=None):
     """Scenes -> (finished mp4 path, SRT text).
     Per scene: Myanmar narration (edge-tts) + slow zoom-in on the image
     (10s minimum, longer if the narration needs it). Segments are joined
@@ -1132,7 +1134,10 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None):
     and the user supplied at least one image, the first supplied image is
     reused so the job still completes (Pollinations returns HTTP 402 from
     Render's shared IP, though it answers 200 elsewhere — verified
-    2026-11-13)."""
+    2026-11-13).
+    v28: mode "auto" splits each scene's narration by character (Gemini)
+    and reads each part in that character's own male/female voice, like
+    the TTS auto mode — no single voice picker needed."""
     import shutil
     font_path = find_myanmar_font()
     if font_path is None:
@@ -1154,8 +1159,18 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None):
                 if not first:
                     raise
                 _normalize_scene_image(first, img_path)
-        out_mp3, _srt_path, srt_text, total, _n, tts_dir = synthesize_tts(
-            _cap_narration(scene["narration"]), voice, rate, pitch)
+        narr_text = _cap_narration(scene["narration"])
+        if mode == "auto":
+            key = (api_key or "").strip() or SECRET_KEY
+            try:
+                segments = split_voices(key, narr_text)
+            except Exception:
+                segments = [(narr_text, voice)]
+            out_mp3, _srt_path, srt_text, total, _n, tts_dir = \
+                synthesize_voiced_segments(segments, rate)
+        else:
+            out_mp3, _srt_path, srt_text, total, _n, tts_dir = synthesize_tts(
+                narr_text, voice, rate, pitch)
         narr_path = os.path.join(workdir, f"narr{i}.mp3")
         shutil.copyfile(out_mp3, narr_path)
         shutil.rmtree(tts_dir, ignore_errors=True)
@@ -1391,6 +1406,146 @@ def build_narrated_image_video(workdir, img_path, text, voice, rate, pitch,
     return out_mp4, srt_text
 
 
+def _download_song_audio(query, workdir, url=None):
+    """YouTube ကနေ သီချင်းအသံဖိုင် (mp3) ယူခြင်း။
+    url ပါရင် အဲ့ Link ကို တိုက်ရိုက် ယူတယ်၊ မပါရင် query နဲ့ ရှာပြီး
+    ပထမဆုံး တွေ့တဲ့ ရလဒ်ကို သုံးတယ်။ (title, mp3_path) ပြန်ပေးတယ်။"""
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("yt-dlp မရှိဘူး။ Server ကို ပြန်တင်ဖို့ လိုတယ်။")
+    out_tmpl = os.path.join(workdir, "song.%(ext)s")
+    opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "outtmpl": out_tmpl,
+        "postprocessors": [{"key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192"}],
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            if url:
+                info = ydl.extract_info(url, download=True)
+            else:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+    except Exception:
+        raise RuntimeError("သီချင်း ရှာလို့ မရဘူး။ Link/နာမည် စစ်ပြီး ထပ်စမ်းပါ။")
+    title = ""
+    if info:
+        entries = info.get("entries")
+        if entries:
+            title = (entries[0] or {}).get("title") or ""
+        else:
+            title = info.get("title") or ""
+    mp3_path = os.path.join(workdir, "song.mp3")
+    if not os.path.exists(mp3_path):
+        # Fallback: download က ထွက်လာတဲ့ အသံဖိုင် တစ်ခုခု ရှိရင် သုံးတယ်။
+        cands = [p for p in glob.glob(os.path.join(workdir, "song.*"))
+                 if os.path.splitext(p)[1].lower() in
+                 (".mp3", ".m4a", ".webm", ".opus", ".ogg")]
+        if not cands:
+            raise RuntimeError("သီချင်း ရှာလို့ မရဘူး။ နာမည် ပြောင်းပြီး ထပ်စမ်းပါ။")
+        mp3_path = cands[0]
+    return title, mp3_path
+
+
+def _loudest_window(audio_path, duration, window=20.0):
+    """အသံအကျယ်ဆုံး (RMS အမြင့်ဆုံး) `window` စက္ကန့်စာ အပိုင်းရဲ့
+    စတင်ချိန် (စက္ကန့်) ကို ပြန်ပေးတယ် — သီချင်းရဲ့ chorus/အကောင်းဆုံး
+    အပိုင်း ဖြစ်ဖို့ များတယ်။ အစ/အဆုံး 5 စက္ကန့်စီကို ချန်ပြီး ရှာတယ်။"""
+    import array
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", audio_path, "-vn",
+         "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+        capture_output=True, timeout=300)
+    pcm = r.stdout or b""
+    if len(pcm) < 2:
+        return 0.0
+    pcm = pcm[:len(pcm) // 2 * 2]
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    sr = 16000
+    n_sec = max(int(duration), 1)
+    buckets = []
+    for s in range(n_sec):
+        seg = samples[s * sr:(s + 1) * sr]
+        if not seg:
+            buckets.append(0.0)
+        else:
+            buckets.append(sum(x * x for x in seg) / len(seg))
+    w = int(window)
+    if len(buckets) <= w:
+        return 0.0
+    lo = min(5, len(buckets) - w)
+    hi = max(lo, len(buckets) - w - 5)
+    pref = [0.0]
+    for b in buckets:
+        pref.append(pref[-1] + b)
+    best_start, best_val = lo, -1.0
+    for start in range(lo, hi + 1):
+        val = pref[start + w] - pref[start]
+        if val > best_val:
+            best_val, best_start = val, start
+    return float(best_start)
+
+
+def build_mtv_video(workdir, img_path, song_query, link=None, clip_seconds=20):
+    """(image, song search text or YouTube link) -> (finished mp4 path,
+    song title). သီချင်းကို ရှာယူ (သို့) Link ကနေ ယူ → အသံအကျယ်ဆုံး
+    20 စက္ကန့်စာ အပိုင်း (chorus) ကို ဖြတ် → ပုံကို slow zoom နဲ့ MTV
+    ထုတ်တယ်။ 20 စက္ကန့် အသံကို narration.mp3 အဖြစ် workdir မှာ ထားတယ်
+    (/audio route အတွက်)။"""
+    import shutil
+    title, song_mp3 = _download_song_audio(song_query, workdir, link)
+    full_dur = probe_duration(song_mp3) or 0.0
+    if full_dur <= 0:
+        raise RuntimeError("သီချင်းအသံ ဖတ်လို့ မရဘူး။")
+    dur = min(float(clip_seconds), full_dur)
+    start = _loudest_window(song_mp3, full_dur, dur) if full_dur > dur else 0.0
+    clip_mp3 = os.path.join(workdir, "clip.mp3")
+    fade_start = max(dur - 1.0, 0.0)
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", song_mp3, "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
+         "-af", f"afade=t=in:st=0:d=0.3,afade=t=out:st={fade_start:.3f}:d=1.0",
+         "-c:a", "libmp3lame", "-b:a", "192k", clip_mp3],
+        capture_output=True, text=True, errors="ignore", timeout=300)
+    if r.returncode != 0 or not os.path.exists(clip_mp3):
+        raise RuntimeError("သီချင်း ဖြတ်လို့ မရဘူး: " + r.stderr[-200:])
+    narr_path = os.path.join(workdir, "narration.mp3")
+    shutil.copyfile(clip_mp3, narr_path)
+    # Normalize any user image to vertical 576x1024 (cover crop) so the
+    # zoom math below always works, whatever shape the upload is.
+    norm_path = os.path.join(workdir, "image_norm.jpg")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", img_path, "-vf",
+         "scale=576:1024:force_original_aspect_ratio=increase,crop=576:1024",
+         "-frames:v", "1", norm_path],
+        capture_output=True, text=True, errors="ignore", timeout=300)
+    if r.returncode != 0 or not os.path.exists(norm_path):
+        raise RuntimeError("ပုံ ဖတ်လို့ မရဘူး။ JPG/PNG ပုံ ထည့်ပါ။")
+    frames = int(math.ceil(dur * 25))
+    dur = frames / 25.0
+    out_mp4 = os.path.join(workdir, "voiceover.mp4")
+    filt = ("[0:v]zoompan=z='min(zoom+0.0012,1.4)':x='iw/2-(iw/zoom/2)'"
+            f":y='ih/2-(ih/zoom/2)':d={frames}:s=576x1024:fps=25[v];[1:a]apad[a]")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", norm_path, "-i", narr_path,
+         "-filter_complex", filt,
+         "-map", "[v]", "-map", "[a]", "-t", f"{dur:.3f}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-c:a", "aac", "-b:a", "128k", out_mp4],
+        capture_output=True, text=True, errors="ignore", timeout=900)
+    if r.returncode != 0 or not os.path.exists(out_mp4):
+        raise RuntimeError("MTV ထုတ်လို့ မရဘူး: " + r.stderr[-200:])
+    return out_mp4, title
+
+
 # ---------------- UI ----------------
 
 if SECRET_KEY:
@@ -1402,7 +1557,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v27 (faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v29 (MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1594,7 +1749,7 @@ if os.environ.get("RENDER"):
             _jobs[job_id] = result
 
     def _run_prompt_video_job(job_id, prompt, api_key, voice, rate, pitch,
-                              img_tmp_paths=None):
+                              img_tmp_paths=None, mode="manual"):
         import shutil
         workdir = tempfile.mkdtemp(prefix="prompt_video_")
         try:
@@ -1603,7 +1758,8 @@ if os.environ.get("RENDER"):
                 raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
             scenes = generate_script(key, prompt)
             _out_mp4, srt_text = build_prompt_video(
-                workdir, scenes, voice, rate, pitch, img_tmp_paths)
+                workdir, scenes, voice, rate, pitch, img_tmp_paths,
+                mode, api_key)
             result = {"status": "done", "srt": srt_text,
                       "audio_url": f"/api/download/{job_id}/audio",
                       "video_url": f"/api/download/{job_id}/video"}
@@ -1632,6 +1788,27 @@ if os.environ.get("RENDER"):
                 workdir, img_tmp_path, text, voice, rate, pitch, mode,
                 api_key, engine, style)
             result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio",
+                      "video_url": f"/api/download/{job_id}/video"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+            shutil.rmtree(workdir, ignore_errors=True)
+        finally:
+            try:
+                os.unlink(img_tmp_path)
+            except Exception:
+                pass
+        with _jobs_lock:
+            _jobs[job_id] = result
+
+    def _run_mtv_job(job_id, img_tmp_path, song_query, link=None):
+        import shutil
+        workdir = tempfile.mkdtemp(prefix="mtv_")
+        try:
+            _out_mp4, title = build_mtv_video(workdir, img_tmp_path, song_query, link)
+            result = {"status": "done", "title": title,
                       "audio_url": f"/api/download/{job_id}/audio",
                       "video_url": f"/api/download/{job_id}/video"}
             with _jobs_lock:
@@ -1796,6 +1973,7 @@ if os.environ.get("RENDER"):
     def api_prompt_video(prompt: str = Form(...), api_key: str = Form(None),
                          voice: str = Form("my-MM-NilarNeural"),
                          rate: int = Form(0), pitch: int = Form(0),
+                         mode: str = Form("manual"),
                          image1: UploadFile = File(None),
                          image2: UploadFile = File(None),
                          image3: UploadFile = File(None)):
@@ -1809,6 +1987,8 @@ if os.environ.get("RENDER"):
             voice = "my-MM-NilarNeural"
         rate = max(-50, min(50, rate))
         pitch = max(-50, min(50, pitch))
+        if mode not in ("manual", "auto"):
+            mode = "manual"
         tmps = []
         try:
             img_paths = []
@@ -1832,7 +2012,7 @@ if os.environ.get("RENDER"):
             _prune_jobs()
             t = threading.Thread(target=_run_prompt_video_job,
                                  args=(job_id, prompt, api_key, voice, rate, pitch,
-                                       img_paths),
+                                       img_paths, mode),
                                  daemon=True)
             t.start()
             return JSONResponse(status_code=202, content={"job_id": job_id})
@@ -1886,6 +2066,52 @@ if os.environ.get("RENDER"):
                                  args=(job_id, tmp.name, text, api_key,
                                        voice, rate, pitch, mode,
                                        engine, style),
+                                 daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/mtv")
+    def api_mtv(image: UploadFile = File(...), song: str = Form(None),
+                link: str = Form(None)):
+        # No Gemini key needed: YouTube search/download + ffmpeg only.
+        # Link wins when both are given (exact song); otherwise search.
+        song = (song or "").strip()
+        link = (link or "").strip()
+        if not song and not link:
+            return JSONResponse(status_code=400,
+                                content={"error": "သီချင်းနာမည် (သို့) Link တစ်ခု ထည့်ပါ။"})
+        if len(song) > 200:
+            return JSONResponse(status_code=400,
+                                content={"error": "song name too long"})
+        if link and not link.lower().startswith(("http://", "https://")):
+            return JSONResponse(status_code=400,
+                                content={"error": "Link က http(s):// နဲ့ စရမယ်။"})
+        if len(link) > 500:
+            return JSONResponse(status_code=400,
+                                content={"error": "link too long"})
+        tmp = None
+        try:
+            data = image.file.read()
+            if not data or len(data) > 15 * 1024 * 1024:
+                return JSONResponse(status_code=400,
+                                    content={"error": "ပုံ အရမ်းကြီးပါတယ်။ 15MB အောက် ထားပါ။"})
+            suffix = os.path.splitext(image.filename or "image.jpg")[1] or ".jpg"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(data)
+            tmp.close()
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_mtv_job,
+                                 args=(job_id, tmp.name, song, link or None),
                                  daemon=True)
             t.start()
             return JSONResponse(status_code=202, content={"job_id": job_id})
