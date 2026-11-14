@@ -2,7 +2,7 @@
 # v2 အသစ်များ:
 # 1) Key ကို Colab Secrets (GEMINI_API_KEY) မှာ တစ်ခါ သိမ်းထားရင် ထပ်ထည့်စရာ မလိုဘူး။
 # 2) Tab 2 အသစ်: စာရိုက်ထည့် → AI အသံဖတ်ပြ + အသံနဲ့ ကိုက်တဲ့ စာတန်း (SRT) ပါ ထုတ်ပေးမယ်။
-#    အသံ:  (အမျိုးသမီး) / (အယောက်ျား) + အမြန်/အနှေး + အသံအနိမ့်အမြင့် ရွေးနိုင်တယ်။
+#    အသံ: Nilar (အမျိုးသမီး) / Thiha (အယောက်ျား) + အမြန်/အနှေး + အသံအနိမ့်အမြင့် ရွေးနိုင်တယ်။
 # လုပ်ပုံ: ဒီ Cell ကို run → ပေါ်လာတဲ့ public link ကို ဖွင့် → Tab ရွေး → လုပ်ဆောင်ပါ။
 # Untitled2.ipynb (သို့) notebook အသစ် မှာ သုံးနိုင်တယ် — 2026-11-13
 # v3 (2026-11-13): App နာမည် "Zhang စတူတီယို" + banner ပုံ။
@@ -21,6 +21,7 @@
 # v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
 # v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
 # v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
+# v31 (2026-11-14): Voiceover-audio API — POST /api/voiceover-audio (အသံဖိုင်ပဲ တင် → Gemini စာသား → AI မြန်မာအသံ → narration.mp3 + narration.m4a (AAC, ဖုန်းမှာ video နဲ့ တွဲဖို့) + SRT; video မထုတ် → ဆာဘာ GB မကုန်) + GET /api/download/{job_id}/audio-m4a။
 
 import glob
 import os
@@ -499,6 +500,35 @@ def transcribe_video_file(video_path, api_key=None):
     if os.path.getsize(audio_path) > 15_000_000:
         raise RuntimeError("Video too long — try a clip under 10 minutes")
     _, _, duration = probe_video(video_path)
+    model_name, cues = transcribe_cues(key, audio_path, duration, workdir)
+    parts = []
+    for k, (start, end, text) in enumerate(cues):
+        parts.append(f"{k + 1}\n{format_time(start)} --> {format_time(end)}\n{text}\n")
+    return model_name, "\n".join(parts)
+
+
+def transcribe_audio_file(audio_path_in, api_key=None):
+    """Audio file -> (model name, SRT text). Used by /api/voiceover-audio
+    (Android app uploads only the extracted audio, not the video).
+    Same pipeline as transcribe_video_file, but the duration comes from
+    probe_duration (audio files have no video stream, so probe_video
+    fails on them with a missing 'width')."""
+    key = (api_key or "").strip() or SECRET_KEY
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not configured on the server")
+    workdir = tempfile.mkdtemp(prefix="api_transcribe_")
+    audio_path = os.path.join(workdir, "audio.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-i", audio_path_in, "-vn", "-ac", "1", "-ar", "16000",
+                        "-c:a", "libmp3lame", "-q:a", "4", audio_path],
+                       capture_output=True, text=True, errors="ignore", timeout=600)
+    if r.returncode != 0 or not os.path.exists(audio_path):
+        raise RuntimeError("အသံဖိုင်ကို ဖတ်လို့ မရဘူး။")
+    if os.path.getsize(audio_path) > 15_000_000:
+        raise RuntimeError("အသံဖိုင် အရမ်းကြီးပါတယ် — 10 မိနစ်အောက် အပိုင်း သုံးပါ။")
+    try:
+        duration = probe_duration(audio_path_in) or 0.0
+    except Exception:
+        duration = 0.0
     model_name, cues = transcribe_cues(key, audio_path, duration, workdir)
     parts = []
     for k, (start, end, text) in enumerate(cues):
@@ -1565,7 +1595,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v30 (Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v31 (voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1756,6 +1786,86 @@ if os.environ.get("RENDER"):
         with _jobs_lock:
             _jobs[job_id] = result
 
+    def _run_voiceover_audio_job(job_id, tmp_path, api_key, voice, rate, pitch, mode="manual"):
+        # v31: audio-only voiceover. The app uploads just the extracted
+        # audio; the server returns the timed Myanmar narration (mp3 for
+        # listening + m4a/AAC for the phone to mux with the original
+        # video) and the SRT. No video is assembled here, so the server
+        # spends almost no bandwidth.
+        try:
+            _model_name, srt_text = transcribe_audio_file(tmp_path, api_key)
+            # Narration text = the transcribed/translated lines in order.
+            narration = " ".join(
+                line.strip()
+                for line in srt_text.splitlines()
+                if line.strip() and "-->" not in line and not line.strip().isdigit()
+            ).strip()
+            if not narration:
+                raise RuntimeError("ဒီ အသံဖိုင်မှာ စကားမတွေ့ဘူး။")
+            video_duration = probe_duration(tmp_path) or 0.0
+            workdir = None
+            out_mp3 = None
+            # v24: cue-timed narration so the Myanmar voice starts each line
+            # when the original line starts. Any failure falls back to the
+            # continuous narration (old behaviour) so the job still succeeds.
+            try:
+                cues = parse_srt_text(srt_text, video_duration)
+                segments = None
+                if mode == "auto":
+                    key = (api_key or "").strip() or SECRET_KEY
+                    if not key:
+                        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                    try:
+                        segments = split_voices(key, narration)
+                    except Exception:
+                        segments = None
+                workdir = tempfile.mkdtemp(prefix="tts_app_")
+                out_mp3 = build_timed_narration(
+                    workdir, cues, video_duration, voice, rate, pitch, segments)
+            except Exception:
+                if workdir:
+                    import shutil
+                    shutil.rmtree(workdir, ignore_errors=True)
+                workdir = None
+                out_mp3 = None
+            if out_mp3 is None:
+                if mode == "auto":
+                    key = (api_key or "").strip() or SECRET_KEY
+                    if not key:
+                        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                    try:
+                        segments = split_voices(key, narration)
+                    except Exception:
+                        segments = [(narration, voice)]
+                    out_mp3, _srt_path, _tts_srt, _total, _n, workdir = \
+                        synthesize_voiced_segments(segments, rate)
+                else:
+                    out_mp3, _srt_path, _tts_srt, _total, _n, workdir = synthesize_tts(
+                        narration, voice, rate, pitch)
+            # AAC copy for the phone mux (MediaMuxer needs AAC in MP4;
+            # the mp3 stays for listening / the existing /audio route).
+            out_m4a = os.path.join(workdir, "narration.m4a")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", out_mp3,
+                 "-c:a", "aac", "-b:a", "128k", out_m4a],
+                capture_output=True, text=True, errors="ignore", timeout=600)
+            if r.returncode != 0 or not os.path.exists(out_m4a):
+                raise RuntimeError("အသံ ပြောင်းလို့ မရဘူး: " + r.stderr[-200:])
+            result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio",
+                      "audio_m4a_url": f"/api/download/{job_id}/audio-m4a"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        with _jobs_lock:
+            _jobs[job_id] = result
+
     def _run_prompt_video_job(job_id, prompt, api_key, voice, rate, pitch,
                               img_tmp_paths=None, mode="manual"):
         import shutil
@@ -1914,6 +2024,17 @@ if os.environ.get("RENDER"):
             return JSONResponse(status_code=404, content={"error": "audio not ready"})
         return FileResponse(mp3_path, media_type="audio/mpeg", filename="narration.mp3")
 
+    @api_app.get("/api/download/{job_id}/audio-m4a")
+    def api_download_audio_m4a(job_id: str):
+        with _jobs_lock:
+            workdir = _job_files.get(job_id)
+        if not workdir:
+            return JSONResponse(status_code=404, content={"error": "unknown job"})
+        m4a_path = os.path.join(workdir, "narration.m4a")
+        if not os.path.exists(m4a_path):
+            return JSONResponse(status_code=404, content={"error": "audio not ready"})
+        return FileResponse(m4a_path, media_type="audio/mp4", filename="narration.m4a")
+
     @api_app.post("/api/gemini-tts")
     def api_gemini_tts(text: str = Form(...), api_key: str = Form(None),
                        voice: str = Form("Sulafat"),
@@ -1965,6 +2086,46 @@ if os.environ.get("RENDER"):
                 _jobs[job_id] = {"status": "pending"}
             _prune_jobs()
             t = threading.Thread(target=_run_voiceover_job,
+                                 args=(job_id, tmp.name, api_key, voice, rate, pitch, mode),
+                                 daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/voiceover-audio")
+    def api_voiceover_audio(audio: UploadFile = File(...), api_key: str = Form(None),
+                            voice: str = Form("my-MM-NilarNeural"),
+                            rate: int = Form(0), pitch: int = Form(0),
+                            mode: str = Form("manual")):
+        # v31: audio-only voiceover — the app uploads the extracted audio
+        # (small file); the server returns narration mp3 + m4a + SRT.
+        tmp = None
+        try:
+            suffix = os.path.splitext(audio.filename or "audio.m4a")[1] or ".m4a"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            while True:
+                chunk = audio.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp.close()
+            if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+                voice = "my-MM-NilarNeural"
+            rate = max(-50, min(50, rate))
+            pitch = max(-50, min(50, pitch))
+            if mode not in ("manual", "auto"):
+                mode = "manual"
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_voiceover_audio_job,
                                  args=(job_id, tmp.name, api_key, voice, rate, pitch, mode),
                                  daemon=True)
             t.start()
