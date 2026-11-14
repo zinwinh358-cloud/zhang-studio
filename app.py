@@ -2,7 +2,7 @@
 # v2 အသစ်များ:
 # 1) Key ကို Colab Secrets (GEMINI_API_KEY) မှာ တစ်ခါ သိမ်းထားရင် ထပ်ထည့်စရာ မလိုဘူး။
 # 2) Tab 2 အသစ်: စာရိုက်ထည့် → AI အသံဖတ်ပြ + အသံနဲ့ ကိုက်တဲ့ စာတန်း (SRT) ပါ ထုတ်ပေးမယ်။
-#    အသံ: Nilar (အမျိုးသမီး) / Thiha (အယောက်ျား) + အမြန်/အနှေး + အသံအနိမ့်အမြင့် ရွေးနိုင်တယ်။
+#    အသံ:  (အမျိုးသမီး) / (အယောက်ျား) + အမြန်/အနှေး + အသံအနိမ့်အမြင့် ရွေးနိုင်တယ်။
 # လုပ်ပုံ: ဒီ Cell ကို run → ပေါ်လာတဲ့ public link ကို ဖွင့် → Tab ရွေး → လုပ်ဆောင်ပါ။
 # Untitled2.ipynb (သို့) notebook အသစ် မှာ သုံးနိုင်တယ် — 2026-11-13
 # v3 (2026-11-13): App နာမည် "Zhang စတူတီယို" + banner ပုံ။
@@ -20,6 +20,7 @@
 # v15 (2026-11-13): TTS API — POST /api/tts (စာသား → AI အသံ + SRT, async) + GET /api/download/{job_id}/audio။
 # v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
 # v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
+# v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
 
 import glob
 import os
@@ -1231,11 +1232,18 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None,
 GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
                       "gemini-3.8-flash-lite-tts"]
 GEMINI_TTS_STYLES = {
-    "natural": ("Say with lively, expressive intonation and varied pitch, "
-                "like a warm storyteller, in the Myanmar language:"),
-    "spooky": ("Say in a slow, spooky, dramatic storytelling voice with "
-               "varied pitch and suspenseful pauses, like telling a ghost "
-               "story, in the Myanmar language:"),
+    # v30: style ညွှန်ကြားချက်ကို မြန်မာလို ရေးထားတယ် + ညွှန်ကြားချက်
+    # ကိုယ်တိုင်ကို အသံထွက် မဖတ်ဖို့ တားထားတယ်။ အရင် အင်္ဂလိပ်
+    # ညွှန်ကြားချက်ကို မော်ဒယ်က အသံထွက် ဖတ်ခဲ့တယ် (အပိုင်းတိုင်း အစ
+    # မှာ အင်္ဂလိပ် ပါလာတဲ့ အကြောင်းရင်း — 'မင်္ဂလာပါ' တစ်လုံးတည်း
+    # 17.9 စက္ကန့် ထွက်ခဲ့တယ်)။
+    "natural": ("အောက်ပါ စာသားကိုသာ မြန်မာဘာသာဖြင့် ဖတ်ပါ။ ဤညွှန်ကြားချက်"
+                "ကို အသံထွက်၍ မဖတ်ပါနှင့်။ နွေးထွေးသော ပုံပြင်ပြောသူ"
+                "တစ်ဦးကဲ့သို့ အသံနိမ့်အမြင့် အမျိုးမျိုးဖြင့် ရှင်သန်စွာ ဖတ်ပါ:"),
+    "spooky": ("အောက်ပါ စာသားကိုသာ မြန်မာဘာသာဖြင့် ဖတ်ပါ။ ဤညွှန်ကြားချက်"
+               "ကို အသံထွက်၍ မဖတ်ပါနှင့်။ သရဲ ပုံပြင်တစ်ပုဒ် ပြောပြနေသ"
+               "ကဲ့သို့ နှေးကွေးပြီး ခြောက်ခြားဖွယ်၊ ရင်ခုန်စဖွယ် အသံနိမ့်"
+               "အမြင့် အမျိုးမျိုးဖြင့် ဖတ်ပါ:"),
 }
 # edge-tts အသံ -> Gemini အသံ အမည် (Nilar = မိန်းကလေး, Thiha = ယောက်ျားလေး)
 GEMINI_VOICE_MAP = {"my-MM-NilarNeural": "Sulafat",
@@ -1557,7 +1565,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v29 (MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v30 (Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
