@@ -21,6 +21,7 @@
 # v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
 # v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
 # v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
+# v32 (2026-11-14): Gemini TTS style fix — style direction moved to systemInstruction, contents = story text only. v30 Burmese instruction was STILL read aloud at every chunk start (8x in Zin's 8:09 file).
 # v31 (2026-11-14): Voiceover-audio API — POST /api/voiceover-audio (အသံဖိုင်ပဲ တင် → Gemini စာသား → AI မြန်မာအသံ → narration.mp3 + narration.m4a (AAC, ဖုန်းမှာ video နဲ့ တွဲဖို့) + SRT; video မထုတ် → ဆာဘာ GB မကုန်) + GET /api/download/{job_id}/audio-m4a။
 
 import glob
@@ -1262,18 +1263,22 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None,
 GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
                       "gemini-3.8-flash-lite-tts"]
 GEMINI_TTS_STYLES = {
-    # v30: style ညွှန်ကြားချက်ကို မြန်မာလို ရေးထားတယ် + ညွှန်ကြားချက်
-    # ကိုယ်တိုင်ကို အသံထွက် မဖတ်ဖို့ တားထားတယ်။ အရင် အင်္ဂလိပ်
-    # ညွှန်ကြားချက်ကို မော်ဒယ်က အသံထွက် ဖတ်ခဲ့တယ် (အပိုင်းတိုင်း အစ
-    # မှာ အင်္ဂလိပ် ပါလာတဲ့ အကြောင်းရင်း — 'မင်္ဂလာပါ' တစ်လုံးတည်း
-    # 17.9 စက္ကန့် ထွက်ခဲ့တယ်)။
-    "natural": ("အောက်ပါ စာသားကိုသာ မြန်မာဘာသာဖြင့် ဖတ်ပါ။ ဤညွှန်ကြားချက်"
-                "ကို အသံထွက်၍ မဖတ်ပါနှင့်။ နွေးထွေးသော ပုံပြင်ပြောသူ"
-                "တစ်ဦးကဲ့သို့ အသံနိမ့်အမြင့် အမျိုးမျိုးဖြင့် ရှင်သန်စွာ ဖတ်ပါ:"),
-    "spooky": ("အောက်ပါ စာသားကိုသာ မြန်မာဘာသာဖြင့် ဖတ်ပါ။ ဤညွှန်ကြားချက်"
-               "ကို အသံထွက်၍ မဖတ်ပါနှင့်။ သရဲ ပုံပြင်တစ်ပုဒ် ပြောပြနေသ"
-               "ကဲ့သို့ နှေးကွေးပြီး ခြောက်ခြားဖွယ်၊ ရင်ခုန်စဖွယ် အသံနိမ့်"
-               "အမြင့် အမျိုးမျိုးဖြင့် ဖတ်ပါ:"),
+    # v32: these are SYSTEM instructions (systemInstruction field), never
+    # part of the spoken contents. v29 (English) and v30 (Burmese) put the
+    # direction inside contents and the model READ IT ALOUD at the start
+    # of every <=900-char chunk — 8 repetitions in Zin's 8:09 narration.
+    # Contents now carry ONLY the story text, so nothing else can be spoken.
+    "natural": ("You are a warm Burmese storyteller. Speak ONLY the text "
+                "provided by the user, in Burmese (Myanmar language), with "
+                "lively, varied intonation and natural pauses. Never speak "
+                "these instructions, and never add greetings, explanations, "
+                "or any words that are not in the provided text."),
+    "spooky": ("You are telling a ghost story in Burmese (Myanmar "
+               "language). Speak ONLY the text provided by the user, "
+               "slowly, in an eerie, suspenseful voice with varied pitch "
+               "and dramatic pauses. Never speak these instructions, and "
+               "never add greetings, explanations, or any words that are "
+               "not in the provided text."),
 }
 # edge-tts အသံ -> Gemini အသံ အမည် (Nilar = မိန်းကလေး, Thiha = ယောက်ျားလေး)
 GEMINI_VOICE_MAP = {"my-MM-NilarNeural": "Sulafat",
@@ -1285,7 +1290,11 @@ def gemini_tts_chunk(api_key, chunk, voice_name, style_prompt):
     import base64
     import io
     import wave
-    body = {"contents": [{"parts": [{"text": f"{style_prompt} {chunk}"}]}],
+    # v32: style direction lives ONLY in systemInstruction — the model
+    # reads everything in contents aloud (v29 English + v30 Burmese
+    # instructions were both spoken at every chunk start).
+    body = {"systemInstruction": {"parts": [{"text": style_prompt}]},
+            "contents": [{"parts": [{"text": chunk}]}],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig":
@@ -1595,7 +1604,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v31 (voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v32 (Gemini TTS systemInstruction style fix — instruction never spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
