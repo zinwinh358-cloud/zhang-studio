@@ -21,6 +21,12 @@
 # v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
 # v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
 # v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
+# v34 (2026-11-14): Gemini TTS — NO style prompt at all. Three formats
+# were PROVEN spoken aloud (v29 English para, v30 Burmese para, v33
+# short imperative + quotes: direction heard at BOTH chunk starts in
+# the 2-chunk test) and systemInstruction (v32) is HTTP 400. Contents
+# now carry ONLY the story text, so nothing else CAN be spoken. The
+# style parameter is accepted for API compat and ignored.
 # v33 (2026-11-14): Gemini TTS style v3 — v32 systemInstruction got HTTP 400 from ALL THREE TTS models (field not supported). Style is back in contents but as a SHORT imperative + QUOTED text (docs pattern: Say ...: "text"), sanitized quotes.
 # v32 (2026-11-14): Gemini TTS style fix — style direction moved to systemInstruction, contents = story text only. v30 Burmese instruction was STILL read aloud at every chunk start (8x in Zin's 8:09 file).
 # v31 (2026-11-14): Voiceover-audio API — POST /api/voiceover-audio (အသံဖိုင်ပဲ တင် → Gemini စာသား → AI မြန်မာအသံ → narration.mp3 + narration.m4a (AAC, ဖုန်းမှာ video နဲ့ တွဲဖို့) + SRT; video မထုတ် → ဆာဘာ GB မကုန်) + GET /api/download/{job_id}/audio-m4a။
@@ -1263,33 +1269,26 @@ def build_prompt_video(workdir, scenes, voice, rate, pitch, scene_images=None,
 # ဖြစ်နိုင်လို့ 3.x TTS မော်ဒယ်တွေပဲ သုံးတယ်။
 GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
                       "gemini-3.8-flash-lite-tts"]
-GEMINI_TTS_STYLES = {
-    # v33: SHORT imperative + the chunk in double quotes (Google's
-    # documented TTS style pattern). v29/v30 used a long direction
-    # paragraph with no quotes and the model READ IT ALOUD at every
-    # chunk (8x in Zin's 8:09 file). v32 systemInstruction was
-    # rejected with HTTP 400 by all three TTS models. The chunk is
-    # sanitized (ASCII quotes -> apostrophes) so nested quotes can't
-    # break the boundary. VERIFY with a 2-chunk transcribe-back test
-    # before telling Zin to regenerate — never trust a 1-word test.
-    "natural": "Say with warm, lively, varied intonation, like a kind storyteller",
-    "spooky": "Say slowly, in an eerie, suspenseful voice, like telling a ghost story",
-}
+# NO GEMINI_TTS_STYLES — DO NOT RE-ADD. Evidence (Nov 2026, live tests
+# with full transcribe-back): every style direction placed in contents
+# is READ ALOUD by these TTS models at the start of EVERY chunk —
+# v29 long English paragraph (8x in Zin's 8:09 file), v30 long Burmese
+# paragraph (8x again), v33 short imperative + quoted text (2x in the
+# 2-chunk test, cues 0:00 and 1:24). systemInstruction (v32) returns
+# HTTP 400 from all three models. Contents = story text ONLY.
 # edge-tts အသံ -> Gemini အသံ အမည် (Nilar = မိန်းကလေး, Thiha = ယောက်ျားလေး)
 GEMINI_VOICE_MAP = {"my-MM-NilarNeural": "Sulafat",
                     "my-MM-ThihaNeural": "Kore"}
 
 
-def gemini_tts_chunk(api_key, chunk, voice_name, style_prompt):
+def gemini_tts_chunk(api_key, chunk, voice_name):
     """One text chunk -> WAV bytes. Tries the TTS models in order."""
     import base64
     import io
     import wave
-    # v33: short imperative + quoted chunk. systemInstruction (v32) is
-    # rejected by the TTS models (HTTP 400); long unquoted directions
-    # (v29/v30) get read aloud. Quotes mark the speakable text.
-    safe_chunk = chunk.replace('"', "'")
-    body = {"contents": [{"parts": [{"text": f'{style_prompt}: "{safe_chunk}"'}]}],
+    # v34: contents carry ONLY the chunk. Any direction text here is
+    # spoken aloud (proven 3x: v29/v30/v33) — see note above.
+    body = {"contents": [{"parts": [{"text": chunk}]}],
 
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
@@ -1346,14 +1345,16 @@ def synthesize_gemini_tts(text, voice_name, style, api_key):
         raise RuntimeError("စာသား ရိုက်ထည့်ပါ။")
     if not (api_key or "").strip():
         raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
-    style_prompt = GEMINI_TTS_STYLES.get(style, GEMINI_TTS_STYLES["natural"])
+    # v34: `style` is accepted for API compat and IGNORED — no direction
+    # text may reach the TTS request (see NO GEMINI_TTS_STYLES note).
+    _ = style
     workdir = tempfile.mkdtemp(prefix="tts_app_")
     chunk_files = []
     all_cues = []
     shift = 0.0
     idx = 0
     for ch in chunk_text(text):
-        wav = gemini_tts_chunk(api_key, ch, voice_name, style_prompt)
+        wav = gemini_tts_chunk(api_key, ch, voice_name)
         if not wav:
             raise RuntimeError("အသံ ထုတ်လို့ မရဘူး။ ထပ်စမ်းကြည့်ပါ။")
         cf = os.path.join(workdir, f"part{idx}.wav")
@@ -1603,7 +1604,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v33 (Gemini TTS quoted style prompt — short imperative + quoted text + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v34 (Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
