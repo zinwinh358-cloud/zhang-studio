@@ -22,6 +22,7 @@
 # v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
 # v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
+# v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v34 (2026-11-14): Gemini TTS — NO style prompt at all. Three formats
 # were PROVEN spoken aloud (v29 English para, v30 Burmese para, v33
 # short imperative + quotes: direction heard at BOTH chunk starts in
@@ -36,6 +37,7 @@ import glob
 import os
 import subprocess
 import sys
+import time
 
 
 def _have_myanmar_font():
@@ -1605,7 +1607,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v35 (transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v36 (chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1668,6 +1670,16 @@ if os.environ.get("RENDER"):
     _jobs_lock = threading.Lock()
 
     def _prune_jobs():
+        # v36: drop abandoned chunked-upload dirs older than 2 hours.
+        try:
+            _uproot = os.path.join(tempfile.gettempdir(), "zs_uploads")
+            _now = time.time()
+            for _name in os.listdir(_uproot):
+                _d = os.path.join(_uproot, _name)
+                if os.path.isdir(_d) and _now - os.path.getmtime(_d) > 7200:
+                    shutil.rmtree(_d, ignore_errors=True)
+        except Exception:
+            pass
         # Keep the job table small: drop oldest finished jobs (and delete
         # their TTS workdirs so mp3 files don't pile up on disk).
         # Called OUTSIDE _jobs_lock (threading.Lock is not reentrant).
@@ -2153,6 +2165,86 @@ if os.environ.get("RENDER"):
             t = threading.Thread(target=_run_voiceover_audio_job,
                                  args=(job_id, tmp.name, api_key, voice, rate, pitch, mode),
                                  daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    _UPLOAD_ROOT = os.path.join(tempfile.gettempdir(), "zs_uploads")
+
+    def _upload_dir(upload_id):
+        # upload_id must be a 32-hex uuid (client-generated) — no path tricks.
+        if not re.fullmatch(r"[0-9a-f]{32}", upload_id or ""):
+            return None
+        return os.path.join(_UPLOAD_ROOT, upload_id)
+
+    @api_app.post("/api/upload-chunk")
+    def api_upload_chunk(upload_id: str = Form(...), index: int = Form(...),
+                         total: int = Form(...), chunk: UploadFile = File(...)):
+        # v36: one ~1MB piece of a chunked upload. Idempotent — re-uploading
+        # the same index overwrites the part, so the app can resume.
+        updir = _upload_dir(upload_id)
+        if updir is None or index < 0 or total < 1 or index >= total:
+            return JSONResponse(status_code=400, content={"error": "bad upload_id/index/total"})
+        try:
+            os.makedirs(updir, exist_ok=True)
+            part = os.path.join(updir, "%05d.part" % index)
+            with open(part, "wb") as f:
+                while True:
+                    data = chunk.file.read(1024 * 1024)
+                    if not data:
+                        break
+                    f.write(data)
+            return JSONResponse(content={"ok": True, "index": index})
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/upload-complete")
+    def api_upload_complete(upload_id: str = Form(...), total: int = Form(...),
+                            filename: str = Form("audio.m4a"),
+                            kind: str = Form("transcribe"),
+                            api_key: str = Form(None),
+                            voice: str = Form("my-MM-NilarNeural"),
+                            rate: int = Form(0), pitch: int = Form(0),
+                            mode: str = Form("manual")):
+        # v36: join the parts (in index order) into one temp file, then
+        # start the same job the single-shot endpoints start.
+        updir = _upload_dir(upload_id)
+        if updir is None or total < 1 or kind not in ("transcribe", "voiceover-audio"):
+            return JSONResponse(status_code=400, content={"error": "bad upload_id/total/kind"})
+        missing = [i for i in range(total)
+                   if not os.path.exists(os.path.join(updir, "%05d.part" % i))]
+        if missing:
+            return JSONResponse(status_code=400, content={"error": "missing parts", "missing": missing})
+        tmp = None
+        try:
+            suffix = os.path.splitext(filename or "audio.m4a")[1] or ".m4a"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            for i in range(total):
+                with open(os.path.join(updir, "%05d.part" % i), "rb") as f:
+                    shutil.copyfileobj(f, tmp, 1024 * 1024)
+            tmp.close()
+            shutil.rmtree(updir, ignore_errors=True)
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            if kind == "transcribe":
+                target, args = _run_job, (job_id, tmp.name, api_key)
+            else:
+                if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+                    voice = "my-MM-NilarNeural"
+                rate = max(-50, min(50, rate))
+                pitch = max(-50, min(50, pitch))
+                if mode not in ("manual", "auto"):
+                    mode = "manual"
+                target, args = _run_voiceover_audio_job, (job_id, tmp.name, api_key, voice, rate, pitch, mode)
+            t = threading.Thread(target=target, args=args, daemon=True)
             t.start()
             return JSONResponse(status_code=202, content={"job_id": job_id})
         except Exception as e:
