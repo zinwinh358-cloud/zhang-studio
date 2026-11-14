@@ -24,6 +24,8 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v40 (2026-11-14): resolve-link HTML fallback — when yt-dlp fails (e.g. Xiaohongshu login redirect), fetch the share page with a browser UA and take an embedded .mp4 URL (verified on Zin's xhslink: rednotecdn mp4 in page HTML).
+# v39 (2026-11-14): resolve-link errors now include a 'detail' field with yt-dlp's last stderr line (diagnosis: both test links 400'd on v38 with the cause swallowed).
 # v38 (2026-11-14): LINK resolve — POST /api/resolve-link returns direct media URL(s) for a video link (yt-dlp -J) WITHOUT downloading the video through Render: the phone downloads from the platform CDN itself, so server bandwidth (5GB/mo) is untouched. Returns video url + audio_url (DASH splits, e.g. YouTube) + title.
 # v34 (2026-11-14): Gemini TTS — NO style prompt at all. Three formats
 # were PROVEN spoken aloud (v29 English para, v30 Burmese para, v33
@@ -1622,7 +1624,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v38 (link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v40 (HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -2272,60 +2274,100 @@ if os.environ.get("RENDER"):
 
     @api_app.post("/api/resolve-link")
     def api_resolve_link(link: str = Form(...)):
-        # v38: resolve a video link to direct media URL(s). The video
+        # v40: resolve a video link to direct media URL(s). The video
         # itself NEVER passes through Render — the phone downloads it
         # from the platform CDN, so the 5GB/mo server bandwidth is
         # untouched (Zin's priority: save server data, 14 Nov).
-        # yt-dlp covers YouTube / TikTok / Facebook / Xiaohongshu.
+        # Path 1: yt-dlp (YouTube / TikTok / Facebook / ...).
+        # Path 2 (v40): HTML fallback — fetch the share page with a
+        # browser User-Agent and take an embedded .mp4 URL. This is
+        # how Xiaohongshu share links resolve: yt-dlp hits the
+        # rednote.com login redirect, but the page HTML (HTTP 200 with
+        # a browser UA) embeds the rednotecdn .mp4 directly
+        # (verified on Zin's xhslink, 14 Nov 22:05).
         import json
+        import re
         link = (link or "").strip()
         if not link.startswith(("http://", "https://")):
             return JSONResponse(status_code=400, content={"error": "link မမှန်ဘူး။ http(s) link ထည့်ပါ။"})
+
+        def _html_fallback(page_url):
+            try:
+                import requests
+            except ImportError:
+                return None, None
+            try:
+                resp = requests.get(
+                    page_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+                             "Accept": "text/html,application/xhtml+xml"},
+                    timeout=30, allow_redirects=True)
+                if resp.status_code != 200:
+                    return None, None
+                found = re.findall(r"https://\S+?\.mp4", resp.text)
+                url = found[0].replace("\\/", "/") if found else None
+                title_m = re.search(r"<title>([^<]{1,120})</title>", resp.text)
+                title = title_m.group(1).strip() if title_m else None
+                return url, title
+            except Exception:
+                return None, None
+
+        yt_detail = None
         try:
             r = subprocess.run(
                 ["yt-dlp", "--no-warnings", "-J", "--no-playlist",
                  "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best", link],
                 capture_output=True, text=True, errors="ignore", timeout=120)
             if r.returncode != 0:
-                return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။"})
-            try:
-                data = json.loads(r.stdout)
-            except ValueError:
-                return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။"})
-            if data.get("entries"):
-                data = data["entries"][0]
-            downloads = data.get("requested_downloads") or []
-            if not downloads and data.get("url"):
-                downloads = [data]
+                err_lines = [ln for ln in (r.stderr or "").splitlines() if ln.strip()]
+                yt_detail = err_lines[-1][:200] if err_lines else "yt-dlp exit %d" % r.returncode
+            else:
+                try:
+                    data = json.loads(r.stdout)
+                except ValueError:
+                    data = None
+                    yt_detail = "bad json: " + (r.stdout or "")[:100]
+                if isinstance(data, dict):
+                    if data.get("entries"):
+                        data = data["entries"][0]
+                    downloads = data.get("requested_downloads") or []
+                    if not downloads and data.get("url"):
+                        downloads = [data]
 
-            def pick(want_video):
-                cands = []
-                for d in downloads:
-                    u = d.get("url") or ""
-                    if not u.startswith("http"):
-                        continue
-                    has_video = d.get("vcodec") not in (None, "none")
-                    has_audio = d.get("acodec") not in (None, "none")
-                    if want_video and not has_video:
-                        continue
-                    if not want_video and (has_video or not has_audio):
-                        continue
-                    cands.append(d)
-                if not cands:
-                    return None
-                https = [d for d in cands if (d.get("protocol") or "") == "https"]
-                return (https or cands)[0].get("url")
+                    def pick(want_video):
+                        cands = []
+                        for d in downloads:
+                            u = d.get("url") or ""
+                            if not u.startswith("http"):
+                                continue
+                            has_video = d.get("vcodec") not in (None, "none")
+                            has_audio = d.get("acodec") not in (None, "none")
+                            if want_video and not has_video:
+                                continue
+                            if not want_video and (has_video or not has_audio):
+                                continue
+                            cands.append(d)
+                        if not cands:
+                            return None
+                        https = [d for d in cands if (d.get("protocol") or "") == "https"]
+                        return (https or cands)[0].get("url")
 
-            video_url = pick(True)
-            if not video_url:
-                return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။"})
-            return JSONResponse(content={
-                "url": video_url,
-                "audio_url": pick(False),
-                "title": data.get("title"),
-            })
+                    video_url = pick(True)
+                    if video_url:
+                        return JSONResponse(content={
+                            "url": video_url,
+                            "audio_url": pick(False),
+                            "title": data.get("title"),
+                        })
+                    yt_detail = "%d download(s), no video format" % len(downloads)
+                elif data is not None:
+                    yt_detail = "empty result: " + (r.stdout or "")[:100]
         except Exception as e:
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            yt_detail = "yt-dlp error: %s" % str(e)[:150]
+        fb_url, fb_title = _html_fallback(link)
+        if fb_url:
+            return JSONResponse(content={"url": fb_url, "audio_url": None, "title": fb_title})
+        return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။", "detail": yt_detail or "no video found"})
 
     @api_app.post("/api/prompt-video")
     def api_prompt_video(prompt: str = Form(...), api_key: str = Form(None),
