@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v41 (2026-11-14): resolve-link flattens merged formats (YouTube 401+140 has no entry url) + 1080p cap; transcribe_cues window retry x2 + 5s pacing + partial cues kept + long audio fails loudly with the window error instead of truncating via whole-audio fallback.
 # v40 (2026-11-14): resolve-link HTML fallback — when yt-dlp fails (e.g. Xiaohongshu login redirect), fetch the share page with a browser UA and take an embedded .mp4 URL (verified on Zin's xhslink: rednotecdn mp4 in page HTML).
 # v39 (2026-11-14): resolve-link errors now include a 'detail' field with yt-dlp's last stderr line (diagnosis: both test links 400'd on v38 with the cause swallowed).
 # v38 (2026-11-14): LINK resolve — POST /api/resolve-link returns direct media URL(s) for a video link (yt-dlp -J) WITHOUT downloading the video through Render: the phone downloads from the platform CDN itself, so server bandwidth (5GB/mo) is untouched. Returns video url + audio_url (DASH splits, e.g. YouTube) + title.
@@ -482,30 +483,56 @@ def transcribe_cues(key, audio_path, duration, workdir):
             windows.append((t, nxt))
             t = nxt
     if windows:
-        try:
-            all_cues = []
-            model_name = None
-            for idx, (s, e) in enumerate(windows):
-                seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
-                seg_dur = e - s
+        # v41: per-window retry + pacing + partial results. The old code
+        # discarded ALL windows when any one call failed and fell through
+        # to a whole-audio call that truncates long audio (two 479s jobs
+        # errored this way, 14 Nov 22:03/22:05). Now: each window gets 2
+        # attempts (15s apart), 5s pacing between windows, partial cues
+        # are kept, and long audio fails loudly with the real window
+        # error instead of silently returning a truncated transcript.
+        all_cues = []
+        model_name = None
+        last_err = None
+        failed_idx = None
+        for idx, (s, e) in enumerate(windows):
+            seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
+            seg_dur = e - s
+            ok = False
+            for attempt in range(2):
                 r = subprocess.run(
                     ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", audio_path,
                      "-t", f"{seg_dur:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
                      seg_path],
                     capture_output=True, text=True, errors="ignore", timeout=300)
                 if r.returncode != 0 or not os.path.exists(seg_path):
-                    raise RuntimeError("segment extract failed")
-                m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
+                    last_err = RuntimeError("segment extract failed")
+                    if attempt == 0:
+                        time.sleep(5)
+                    continue
+                try:
+                    m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
+                except Exception as ex:
+                    last_err = ex
+                    if attempt == 0:
+                        time.sleep(15)
+                    continue
                 model_name = model_name or m
                 seg_cues = split_long_cues(split_long_cues(
                     parse_srt_text(raw, seg_dur)))
                 for (cs, ce, t) in seg_cues:
                     all_cues.append((cs + s, min(ce + s, duration), t))
-            if all_cues:
-                all_cues.sort(key=lambda c: c[0])
-                return model_name, snap_cues_to_speech(all_cues, segments, duration)
-        except Exception:
-            pass  # fall through to whole-audio below
+                ok = True
+                break
+            if not ok:
+                failed_idx = idx
+                break
+            if idx < len(windows) - 1:
+                time.sleep(5)
+        if all_cues:
+            all_cues.sort(key=lambda c: c[0])
+            return model_name, snap_cues_to_speech(all_cues, segments, duration)
+        if duration > 90:
+            raise RuntimeError("window %s failed: %s" % (failed_idx, last_err))
     model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
     cues = split_long_cues(split_long_cues(parse_srt_text(raw_text, duration)))
     return model_name, snap_cues_to_speech(cues, segments, duration)
@@ -1624,7 +1651,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v40 (HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v41 (merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -2316,7 +2343,7 @@ if os.environ.get("RENDER"):
         try:
             r = subprocess.run(
                 ["yt-dlp", "--no-warnings", "-J", "--no-playlist",
-                 "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best", link],
+                 "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/best", link],
                 capture_output=True, text=True, errors="ignore", timeout=120)
             if r.returncode != 0:
                 err_lines = [ln for ln in (r.stderr or "").splitlines() if ln.strip()]
@@ -2333,6 +2360,17 @@ if os.environ.get("RENDER"):
                     downloads = data.get("requested_downloads") or []
                     if not downloads and data.get("url"):
                         downloads = [data]
+                    # v41: merged formats (e.g. YouTube "401+140") have no
+                    # url on the entry itself — the real URLs live in
+                    # requested_formats. Flatten so pick() sees them.
+                    flat = []
+                    for d in downloads:
+                        subs = d.get("requested_formats")
+                        if subs:
+                            flat.extend(subs)
+                        else:
+                            flat.append(d)
+                    downloads = flat
 
                     def pick(want_video):
                         cands = []
