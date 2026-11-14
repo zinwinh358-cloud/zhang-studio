@@ -21,6 +21,7 @@
 # v16 (2026-11-13): Voiceover API — POST /api/voiceover (video → Gemini စာသား → AI မြန်မာအသံ → ffmpeg နဲ့ Video ထဲ အသံထည့်) + GET /api/download/{job_id}/video။
 # v29 (2026-11-14): MTV API — POST /api/mtv (လူပုံ + သီချင်းနာမည် → YouTube ကနေ သီချင်း ရှာပြီး အစ 20 စက္ကန့်စာ slow-zoom MTV ထုတ်ခြင်း, async)။
 # v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
+# v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v34 (2026-11-14): Gemini TTS — NO style prompt at all. Three formats
 # were PROVEN spoken aloud (v29 English para, v30 Burmese para, v33
 # short imperative + quotes: direction heard at BOTH chunk starts in
@@ -1604,7 +1605,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v34 (Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v35 (transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1680,9 +1681,24 @@ if os.environ.get("RENDER"):
                 if workdir:
                     shutil.rmtree(workdir, ignore_errors=True)
 
+    def _has_video_stream(path):
+        # v35: audio-only uploads (phone-extracted .m4a) have no video
+        # stream, so probe_video would KeyError on 'width'. Detect first.
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_entries", "stream=codec_type",
+                                "-of", "csv=p=0", path],
+                               capture_output=True, text=True, errors="ignore", timeout=60)
+            return "video" in r.stdout
+        except Exception:
+            return True
+
     def _run_job(job_id, tmp_path, api_key):
         try:
-            model_name, srt_text = transcribe_video_file(tmp_path, api_key)
+            if _has_video_stream(tmp_path):
+                model_name, srt_text = transcribe_video_file(tmp_path, api_key)
+            else:
+                model_name, srt_text = transcribe_audio_file(tmp_path, api_key)
             result = {"status": "done", "srt": srt_text, "model": model_name}
         except Exception as e:
             result = {"status": "error", "error": str(e)}
