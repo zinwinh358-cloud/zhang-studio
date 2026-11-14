@@ -23,6 +23,7 @@
 # v30 (2026-11-14): Gemini TTS style ညွှန်ကြားချက် မြန်မာလို ပြောင်း + ညွှန်ကြားချက် အသံထွက် မဖတ်ဖို့ တား (အင်္ဂလိပ် ညွှန်ကြားချက် အသံထွက် ဖတ်မိတဲ့ ဘက်ဂ် ပြင်)။
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
+# v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
 # v34 (2026-11-14): Gemini TTS — NO style prompt at all. Three formats
 # were PROVEN spoken aloud (v29 English para, v30 Burmese para, v33
 # short imperative + quotes: direction heard at BOTH chunk starts in
@@ -464,6 +465,19 @@ def transcribe_cues(key, audio_path, duration, workdir):
             t = nxt
         if len(windows) > 10:
             windows = None
+    elif duration > 60:
+        # v37: long audio — fixed 60s windows. One Gemini call must never
+        # transcribe minutes of speech: the model truncates its output
+        # (479s drama -> 2 cues, 14 Nov). A short tail (<5s) joins the
+        # previous window instead of becoming a stub window.
+        windows = []
+        t = 0.0
+        while t < duration:
+            nxt = min(t + 60.0, duration)
+            if duration - nxt < 5.0 and nxt < duration:
+                nxt = duration
+            windows.append((t, nxt))
+            t = nxt
     if windows:
         try:
             all_cues = []
@@ -1607,7 +1621,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v36 (chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v37 (60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
