@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v38 (2026-11-14): LINK resolve — POST /api/resolve-link returns direct media URL(s) for a video link (yt-dlp -J) WITHOUT downloading the video through Render: the phone downloads from the platform CDN itself, so server bandwidth (5GB/mo) is untouched. Returns video url + audio_url (DASH splits, e.g. YouTube) + title.
 # v34 (2026-11-14): Gemini TTS — NO style prompt at all. Three formats
 # were PROVEN spoken aloud (v29 English para, v30 Burmese para, v33
 # short imperative + quotes: direction heard at BOTH chunk starts in
@@ -1621,7 +1622,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v37 (60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v38 (link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -2267,6 +2268,63 @@ if os.environ.get("RENDER"):
                     os.unlink(tmp.name)
                 except Exception:
                     pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/resolve-link")
+    def api_resolve_link(link: str = Form(...)):
+        # v38: resolve a video link to direct media URL(s). The video
+        # itself NEVER passes through Render — the phone downloads it
+        # from the platform CDN, so the 5GB/mo server bandwidth is
+        # untouched (Zin's priority: save server data, 14 Nov).
+        # yt-dlp covers YouTube / TikTok / Facebook / Xiaohongshu.
+        import json
+        link = (link or "").strip()
+        if not link.startswith(("http://", "https://")):
+            return JSONResponse(status_code=400, content={"error": "link မမှန်ဘူး။ http(s) link ထည့်ပါ။"})
+        try:
+            r = subprocess.run(
+                ["yt-dlp", "--no-warnings", "-J", "--no-playlist",
+                 "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best", link],
+                capture_output=True, text=True, errors="ignore", timeout=120)
+            if r.returncode != 0:
+                return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။"})
+            try:
+                data = json.loads(r.stdout)
+            except ValueError:
+                return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။"})
+            if data.get("entries"):
+                data = data["entries"][0]
+            downloads = data.get("requested_downloads") or []
+            if not downloads and data.get("url"):
+                downloads = [data]
+
+            def pick(want_video):
+                cands = []
+                for d in downloads:
+                    u = d.get("url") or ""
+                    if not u.startswith("http"):
+                        continue
+                    has_video = d.get("vcodec") not in (None, "none")
+                    has_audio = d.get("acodec") not in (None, "none")
+                    if want_video and not has_video:
+                        continue
+                    if not want_video and (has_video or not has_audio):
+                        continue
+                    cands.append(d)
+                if not cands:
+                    return None
+                https = [d for d in cands if (d.get("protocol") or "") == "https"]
+                return (https or cands)[0].get("url")
+
+            video_url = pick(True)
+            if not video_url:
+                return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။"})
+            return JSONResponse(content={
+                "url": video_url,
+                "audio_url": pick(False),
+                "title": data.get("title"),
+            })
+        except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     @api_app.post("/api/prompt-video")
