@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
 # v47 (2026-11-15): stop after 3 CONSECUTIVE fully-failed windows (any cause: 503 overload, empty replies) — Zin's new-key job ground for 20 min, so v46's 429-only fail-fast does not cover overload. Partial cues already collected are still returned; with none, a clear 'models busy, wait and re-tap' error. Isolated failed windows (1-2) are still skipped, not fatal.
@@ -186,12 +187,16 @@ def transcribe_with_gemini(api_key, audio_path, duration):
         "If the speech is in ANY other language (Chinese, Thai, English, Indonesian, Korean, or any "
         "other), TRANSLATE the meaning into natural, fluent Myanmar (Burmese) language — translate "
         "the MEANING, not the sounds. "
-        "NEVER write foreign-language sounds phonetically in Myanmar script (no transliteration). "
+        "Keep personal names sounding like the original: write names in Myanmar script "
+        "as close to their original pronunciation as possible (transliterate names) — "
+        "never replace a name with a description of the person. "
+        "NEVER write other foreign-language words phonetically in Myanmar script (no transliteration). "
         "Every cue must be meaningful Myanmar words a Myanmar viewer can understand. "
         "Do not summarize, do not add explanations. "
         "Transcribe EVERY utterance you hear from the very start to the very end — "
         "do not skip, omit, or merge any speech: every spoken sentence must appear "
-        "in the subtitles. If you hear speech in any part of the audio, it must "
+        "in the subtitles, INCLUDING short shouts, exclamations, cries, and single-word "
+        "utterances — even one shouted word gets its own cue. If you hear speech in any part of the audio, it must "
         "have cues. Never refuse, never apologize, never explain — if there is "
         "speech, transcribe it. "
         "Return ONLY a valid SRT subtitle file: numbered cues, each with start --> end timestamps "
@@ -510,14 +515,20 @@ def transcribe_cues(key, audio_path, duration, workdir):
         if len(windows) > 10:
             windows = None
     elif duration > 60:
-        # v37: long audio — fixed 60s windows. One Gemini call must never
+        # v37: long audio — fixed windows. One Gemini call must never
         # transcribe minutes of speech: the model truncates its output
-        # (479s drama -> 2 cues, 14 Nov). A short tail (<5s) joins the
-        # previous window instead of becoming a stub window.
+        # (479s drama -> 2 cues, 14 Nov).
+        # v50: 60s -> 30s windows. In dense noisy audio (loud music +
+        # SFX + shouting) Gemini drops short utterances inside a 60s
+        # window: Zin's 86s drama lost the 8-9s and 21-24s shouts
+        # (15 Nov 18:22 SRT) although both windows "succeeded".
+        # Shorter windows = less audio per call = fewer missed lines.
+        # A short tail (<5s) joins the previous window instead of
+        # becoming a stub window.
         windows = []
         t = 0.0
         while t < duration:
-            nxt = min(t + 60.0, duration)
+            nxt = min(t + 30.0, duration)
             if duration - nxt < 5.0 and nxt < duration:
                 nxt = duration
             windows.append((t, nxt))
@@ -1786,7 +1797,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v49 (voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v50 (30s windows + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
