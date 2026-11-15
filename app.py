@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
 # v47 (2026-11-15): stop after 3 CONSECUTIVE fully-failed windows (any cause: 503 overload, empty replies) — Zin's new-key job ground for 20 min, so v46's 429-only fail-fast does not cover overload. Partial cues already collected are still returned; with none, a clear 'models busy, wait and re-tap' error. Isolated failed windows (1-2) are still skipped, not fatal.
 # v46 (2026-11-15): quota fail-fast — when ALL 8 models answer 429, the quota is spent: stop the job at once with a clear message (wait till ~15:00 or switch key) instead of grinding every window + whole-audio for 20 minutes (7-min video, 15 Nov 13:46). Partial cues already collected are still returned (v45 skip rule).
@@ -1785,7 +1786,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v48 (strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v49 (voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -2081,6 +2082,91 @@ if os.environ.get("RENDER"):
         with _jobs_lock:
             _jobs[job_id] = result
 
+    def _run_voiceover_srt_job(job_id, srt_text, video_duration, api_key, voice, rate, pitch, mode="manual"):
+        # v49: SRT-to-voice voiceover. The app sends an SRT file (no
+        # audio at all) + the video duration; the server synthesizes
+        # the TIMED Myanmar narration from the SRT cues and returns
+        # narration.mp3 + narration.m4a (AAC, for the phone mux) +
+        # the SRT. Same narration machinery as _run_voiceover_audio_job,
+        # minus transcription — for videos with no usable audio.
+        try:
+            srt_text = (srt_text or "").strip()
+            if not srt_text:
+                raise RuntimeError("SRT ဖိုင် မပါဘူး။")
+            try:
+                video_duration = float(video_duration or 0.0)
+            except Exception:
+                video_duration = 0.0
+            cues = parse_srt_text(srt_text, video_duration if video_duration > 0 else 0.0)
+            if not cues:
+                raise RuntimeError("SRT ထဲမှာ စာတန်း မတွေ့ဘူး။")
+            if video_duration <= 0:
+                video_duration = max(end for _s, end, _t in cues)
+            # Narration text = the cue lines in order.
+            narration = " ".join(
+                line.strip()
+                for line in srt_text.splitlines()
+                if line.strip() and "-->" not in line and not line.strip().isdigit()
+            ).strip()
+            if not narration:
+                raise RuntimeError("SRT ထဲမှာ စာသား မတွေ့ဘူး။")
+            workdir = None
+            out_mp3 = None
+            # v24: cue-timed narration so the Myanmar voice starts each
+            # line when the original line starts. Any failure falls back
+            # to the continuous narration so the job still succeeds.
+            try:
+                segments = None
+                if mode == "auto":
+                    key = (api_key or "").strip() or SECRET_KEY
+                    if not key:
+                        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                    try:
+                        segments = split_voices(key, narration)
+                    except Exception:
+                        segments = None
+                workdir = tempfile.mkdtemp(prefix="tts_app_")
+                out_mp3 = build_timed_narration(
+                    workdir, cues, video_duration, voice, rate, pitch, segments)
+            except Exception:
+                if workdir:
+                    import shutil
+                    shutil.rmtree(workdir, ignore_errors=True)
+                workdir = None
+                out_mp3 = None
+            if out_mp3 is None:
+                if mode == "auto":
+                    key = (api_key or "").strip() or SECRET_KEY
+                    if not key:
+                        raise RuntimeError("Gemini API Key လိုတယ်။ App မှာ Key ထည့်ပါ။")
+                    try:
+                        segments = split_voices(key, narration)
+                    except Exception:
+                        segments = [(narration, voice)]
+                    out_mp3, _srt_path, _tts_srt, _total, _n, workdir = \
+                        synthesize_voiced_segments(segments, rate)
+                else:
+                    out_mp3, _srt_path, _tts_srt, _total, _n, workdir = synthesize_tts(
+                        narration, voice, rate, pitch)
+            # AAC copy for the phone mux (MediaMuxer needs AAC in MP4;
+            # the mp3 stays for listening / the existing /audio route).
+            out_m4a = os.path.join(workdir, "narration.m4a")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", out_mp3,
+                 "-c:a", "aac", "-b:a", "128k", out_m4a],
+                capture_output=True, text=True, errors="ignore", timeout=600)
+            if r.returncode != 0 or not os.path.exists(out_m4a):
+                raise RuntimeError("အသံ ပြောင်းလို့ မရဘူး: " + r.stderr[-200:])
+            result = {"status": "done", "srt": srt_text,
+                      "audio_url": f"/api/download/{job_id}/audio",
+                      "audio_m4a_url": f"/api/download/{job_id}/audio-m4a"}
+            with _jobs_lock:
+                _job_files[job_id] = workdir
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+        with _jobs_lock:
+            _jobs[job_id] = result
+
     def _run_prompt_video_job(job_id, prompt, api_key, voice, rate, pitch,
                               img_tmp_paths=None, mode="manual"):
         import shutil
@@ -2351,6 +2437,36 @@ if os.environ.get("RENDER"):
                     os.unlink(tmp.name)
                 except Exception:
                     pass
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/voiceover-srt")
+    def api_voiceover_srt(srt_text: str = Form(...), duration: float = Form(0.0),
+                          api_key: str = Form(None),
+                          voice: str = Form("my-MM-NilarNeural"),
+                          rate: int = Form(0), pitch: int = Form(0),
+                          mode: str = Form("manual")):
+        # v49: SRT-to-voice voiceover — no audio upload at all. The app
+        # sends the SRT text + video duration; the server returns timed
+        # Myanmar narration (mp3 + m4a) + the SRT.
+        try:
+            if not (srt_text or "").strip():
+                return JSONResponse(status_code=400, content={"error": "SRT မပါဘူး။"})
+            if voice not in ("my-MM-NilarNeural", "my-MM-ThihaNeural"):
+                voice = "my-MM-NilarNeural"
+            rate = max(-50, min(50, rate))
+            pitch = max(-50, min(50, pitch))
+            if mode not in ("manual", "auto"):
+                mode = "manual"
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "pending"}
+            _prune_jobs()
+            t = threading.Thread(target=_run_voiceover_srt_job,
+                                 args=(job_id, srt_text, duration, api_key, voice, rate, pitch, mode),
+                                 daemon=True)
+            t.start()
+            return JSONResponse(status_code=202, content={"job_id": job_id})
+        except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     _UPLOAD_ROOT = os.path.join(tempfile.gettempdir(), "zs_uploads")
