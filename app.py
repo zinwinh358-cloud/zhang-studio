@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v51 (2026-11-16): PARALLEL transcription — 3 windows at once (ThreadPoolExecutor, max_workers=3). Same 30s windows, same models, same prompt, same 2 attempts: accuracy unchanged, wall-clock ~3x faster (Zin: transcription took too long). Workers pace themselves (5s after each window) + first wave staggered 2s; quota fail-fast + 3-failure stop + skip-failed-window semantics preserved in parallel form.
 # v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
@@ -77,6 +78,7 @@ if not os.environ.get("SPACE_ID") and not os.environ.get("RENDER") and not _have
 import asyncio
 import base64
 import concurrent.futures
+import threading
 import math
 import re
 import tempfile
@@ -541,9 +543,7 @@ def transcribe_cues(key, audio_path, duration, workdir):
     all_cues = []
     model_name = None
     last_err = None
-    failed_idx = None
     quota_hit = False
-    consec_fail = 0
     stopped_early = False
     if windows:
         # v41: per-window retry + pacing + partial results. The old code
@@ -562,54 +562,93 @@ def transcribe_cues(key, audio_path, duration, workdir):
         # message — no 20-minute grind; partial cues are still returned.
         # v47: 3 consecutive fully-failed windows stop the job (any
         # cause) — overload grinds the same way quota does.
-        for idx, (s, e) in enumerate(windows):
-            seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
-            seg_dur = e - s
-            ok = False
-            for attempt in range(2):
-                r = subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", audio_path,
-                     "-t", f"{seg_dur:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
-                     seg_path],
-                    capture_output=True, text=True, errors="ignore", timeout=300)
-                if r.returncode != 0 or not os.path.exists(seg_path):
-                    last_err = RuntimeError("segment extract failed")
-                    if attempt == 0:
-                        time.sleep(5)
-                    continue
-                try:
-                    m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
-                    if looks_like_junk(raw):
-                        raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
-                    seg_cues = split_long_cues(split_long_cues(
-                        parse_srt_text(raw, seg_dur)))
-                except QuotaExhaustedError as qe:
-                    last_err = qe
-                    quota_hit = True
+        # v51: the windows run 3 AT A TIME (ThreadPoolExecutor). The
+        # sequential loop waited out every Gemini call one by one, so
+        # a 10-min video took 8-15 min (Zin, 16 Nov: too slow). Same
+        # windows, same models, same prompt, same 2 attempts per
+        # window — accuracy is unchanged, wall-clock is ~3x faster.
+        # Each worker paces itself (5s after each window, as before)
+        # and the first wave is staggered 2s apart so calls don't
+        # burst all at once. v46/v47 semantics in parallel form: a
+        # quota error sets the shared stop flag (pending windows skip,
+        # partial cues returned); with no cues at all from 3+ windows
+        # the overload error is raised (sequentially, any all-failed
+        # run of 3+ windows stopped the job the same way).
+        stop_event = threading.Event()
+        results = [None] * len(windows)
+
+        def run_window(idx, s, e):
+            try:
+                # Stagger the first wave so 3 calls don't start in
+                # the same instant (gentler on per-key rate limits).
+                time.sleep((idx % 3) * 2)
+                if stop_event.is_set():
+                    return
+                seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
+                seg_dur = e - s
+                for attempt in range(2):
+                    if stop_event.is_set():
+                        return
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", audio_path,
+                         "-t", f"{seg_dur:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
+                         seg_path],
+                        capture_output=True, text=True, errors="ignore", timeout=300)
+                    if r.returncode != 0 or not os.path.exists(seg_path):
+                        results[idx] = ("error", RuntimeError("segment extract failed"))
+                        if attempt == 0:
+                            time.sleep(5)
+                        continue
+                    try:
+                        m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
+                        if looks_like_junk(raw):
+                            raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
+                        seg_cues = split_long_cues(split_long_cues(
+                            parse_srt_text(raw, seg_dur)))
+                    except QuotaExhaustedError as qe:
+                        results[idx] = ("quota", qe)
+                        stop_event.set()
+                        return
+                    except Exception as ex:
+                        results[idx] = ("error", ex)
+                        if attempt == 0:
+                            time.sleep(15)
+                        continue
+                    cues = [(cs + s, min(ce + s, duration), t)
+                            for (cs, ce, t) in seg_cues]
+                    results[idx] = ("ok", m, cues)
                     break
-                except Exception as ex:
-                    last_err = ex
-                    if attempt == 0:
-                        time.sleep(15)
-                    continue
-                model_name = model_name or m
-                for (cs, ce, t) in seg_cues:
-                    all_cues.append((cs + s, min(ce + s, duration), t))
-                ok = True
-                break
-            if ok:
-                consec_fail = 0
-            if not ok:
-                failed_idx = idx
-                consec_fail += 1
-                # v45: skip this window, continue with the next one.
-            if quota_hit:
-                break
-            if consec_fail >= 3:
-                stopped_early = True
-                break
-            if idx < len(windows) - 1:
-                time.sleep(5)
+                if not stop_event.is_set():
+                    time.sleep(5)
+            except Exception as ex:
+                # v45 spirit: an unexpected window failure is a
+                # skipped window, never a dead job.
+                if results[idx] is None:
+                    results[idx] = ("error", ex)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            futs = [ex.submit(run_window, idx, s, e)
+                    for idx, (s, e) in enumerate(windows)]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+        for res in results:
+            if res is None:
+                continue
+            if res[0] == "ok":
+                if model_name is None:
+                    model_name = res[1]
+                all_cues.extend(res[2])
+            elif res[0] == "quota":
+                quota_hit = True
+                if last_err is None:
+                    last_err = res[1]
+            else:
+                if last_err is None:
+                    last_err = res[1]
+        if not all_cues and len(windows) >= 3 and not quota_hit:
+            # v47 parallel form: every window failed, so the
+            # consecutive-failure run is the whole list.
+            stopped_early = True
         if all_cues:
             all_cues.sort(key=lambda c: c[0])
             return model_name, snap_cues_to_speech(all_cues, segments, duration)
@@ -1797,7 +1836,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v50 (30s windows + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v51 (parallel 3-window transcription + 30s windows + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
