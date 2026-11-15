@@ -790,6 +790,60 @@ VOICE_FEMALE = "my-MM-NilarNeural"
 VOICE_MALE = "my-MM-ThihaNeural"
 
 
+def translate_title(api_key, title):
+    """Video title -> Myanmar title, or None. Never raises: a failed
+    translation must not break link resolving (the app then burns no
+    auto title). Costs 1 Gemini text request against the caller's key
+    (v43: Zin's auto-title ask — no typing, Myanmar name on the top
+    band)."""
+    title = (title or "").strip()
+    if not title or not api_key:
+        return None
+    instruction = (
+        "Translate this video title into natural, fluent Myanmar (Burmese) language. "
+        "If it is already in Myanmar, return it unchanged. "
+        "Return ONLY the translated title — no quotes, no explanation, no extra words. "
+        "If the title is meaningless (only a platform name, a username, numbers, "
+        "or junk with no real title), return an empty string."
+    )
+    payload = {
+        "contents": [{"parts": [{"text": instruction + "\n\nTitle:\n" + title[:200]}]}],
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
+    }
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    try:
+        for name in CANDIDATE_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=60)
+            except requests.exceptions.RequestException:
+                continue
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+                cands = data.get("candidates", [])
+                parts = cands[0].get("content", {}).get("parts", []) if cands else []
+                texts = [t.get("text", "") for t in parts if isinstance(t, dict) and "text" in t]
+                if not texts:
+                    continue
+                out = "\n".join(texts).strip().strip("\"'").strip()
+                out = out.splitlines()[0].strip() if out else ""
+                return out[:80] if out else None
+            if resp.status_code in (404, 503, 429):
+                continue
+            return None
+    except Exception:
+        return None
+    return None
+
+
 def split_voices(api_key, text):
     """Text -> [(segment_text, voice_id)] in order. Raises RuntimeError
     if no Gemini model returns a usable split; the caller falls back to
@@ -1651,7 +1705,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v42 (480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v43 (auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -2300,7 +2354,7 @@ if os.environ.get("RENDER"):
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     @api_app.post("/api/resolve-link")
-    def api_resolve_link(link: str = Form(...)):
+    def api_resolve_link(link: str = Form(...), api_key: str = Form(None)):
         # v40: resolve a video link to direct media URL(s). The video
         # itself NEVER passes through Render — the phone downloads it
         # from the platform CDN, so the 5GB/mo server bandwidth is
@@ -2317,6 +2371,15 @@ if os.environ.get("RENDER"):
         link = (link or "").strip()
         if not link.startswith(("http://", "https://")):
             return JSONResponse(status_code=400, content={"error": "link မမှန်ဘူး။ http(s) link ထည့်ပါ။"})
+
+        def _ok(url, audio_url, title):
+            # v43: auto Myanmar title — translate the resolved title
+            # with the app's key (1 text request); None on any failure.
+            title_mm = translate_title(api_key, title) if api_key else None
+            return JSONResponse(content={
+                "url": url, "audio_url": audio_url,
+                "title": title, "title_mm": title_mm,
+            })
 
         def _html_fallback(page_url):
             try:
@@ -2392,11 +2455,7 @@ if os.environ.get("RENDER"):
 
                     video_url = pick(True)
                     if video_url:
-                        return JSONResponse(content={
-                            "url": video_url,
-                            "audio_url": pick(False),
-                            "title": data.get("title"),
-                        })
+                        return _ok(video_url, pick(False), data.get("title"))
                     yt_detail = "%d download(s), no video format" % len(downloads)
                 elif data is not None:
                     yt_detail = "empty result: " + (r.stdout or "")[:100]
@@ -2404,7 +2463,7 @@ if os.environ.get("RENDER"):
             yt_detail = "yt-dlp error: %s" % str(e)[:150]
         fb_url, fb_title = _html_fallback(link)
         if fb_url:
-            return JSONResponse(content={"url": fb_url, "audio_url": None, "title": fb_title})
+            return _ok(fb_url, None, fb_title)
         return JSONResponse(status_code=400, content={"error": "ဒီ link က video ရှာလို့ မရဘူး။", "detail": yt_detail or "no video found"})
 
     @api_app.post("/api/prompt-video")
