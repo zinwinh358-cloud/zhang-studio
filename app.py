@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v44 (2026-11-15): transcription hardening (Zin: EVERY sound must be subtitled exactly — the most important part). Refusal/junk detection (a reply with no SRT timestamps and no Myanmar chars is junk, never subtitles); window attempts retry on refusal AND parse failure; long audio with a failed window fails loudly instead of silently dropping the tail; short audio falls back to whole-audio before settling for partial cues; prompt demands every utterance, no skipping/merging.
 # v41 (2026-11-14): resolve-link flattens merged formats (YouTube 401+140 has no entry url) + 1080p cap; transcribe_cues window retry x2 + 5s pacing + partial cues kept + long audio fails loudly with the window error instead of truncating via whole-audio fallback.
 # v40 (2026-11-14): resolve-link HTML fallback — when yt-dlp fails (e.g. Xiaohongshu login redirect), fetch the share page with a browser UA and take an embedded .mp4 URL (verified on Zin's xhslink: rednotecdn mp4 in page HTML).
 # v39 (2026-11-14): resolve-link errors now include a 'detail' field with yt-dlp's last stderr line (diagnosis: both test links 400'd on v38 with the cause swallowed).
@@ -178,6 +179,11 @@ def transcribe_with_gemini(api_key, audio_path, duration):
         "NEVER write foreign-language sounds phonetically in Myanmar script (no transliteration). "
         "Every cue must be meaningful Myanmar words a Myanmar viewer can understand. "
         "Do not summarize, do not add explanations. "
+        "Transcribe EVERY utterance you hear from the very start to the very end — "
+        "do not skip, omit, or merge any speech: every spoken sentence must appear "
+        "in the subtitles. If you hear speech in any part of the audio, it must "
+        "have cues. Never refuse, never apologize, never explain — if there is "
+        "speech, transcribe it. "
         "Return ONLY a valid SRT subtitle file: numbered cues, each with start --> end timestamps "
         "in HH:MM:SS,mmm format. Pay close attention to WHEN each phrase starts and ends — "
         "the timestamps must match the speech exactly, not approximately. "
@@ -216,6 +222,18 @@ def transcribe_with_gemini(api_key, audio_path, duration):
             continue
         raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:300]}")
     raise RuntimeError("model တွေ အကုန် အလုပ်များနေတယ် (သို့) စာသား ပြန်မပေးဘူး။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ။")
+
+
+def looks_like_junk(raw_text):
+    """True when a Gemini reply is NOT subtitles: a refusal/explanation
+    in a foreign language with no SRT timestamps. Valid output is ALWAYS
+    Myanmar (the prompt demands translation) and timestamped, so a reply
+    with no timestamps and no Myanmar characters can only be junk — the
+    v41 Korean refusal became fake cues this way. Never silently turn
+    junk into subtitles (v44)."""
+    if "-->" in raw_text:
+        return False
+    return not any("\u1000" <= ch <= "\u109f" for ch in raw_text)
 
 
 def parse_srt_text(raw_text, duration):
@@ -482,6 +500,10 @@ def transcribe_cues(key, audio_path, duration, workdir):
                 nxt = duration
             windows.append((t, nxt))
             t = nxt
+    all_cues = []
+    model_name = None
+    last_err = None
+    failed_idx = None
     if windows:
         # v41: per-window retry + pacing + partial results. The old code
         # discarded ALL windows when any one call failed and fell through
@@ -490,10 +512,10 @@ def transcribe_cues(key, audio_path, duration, workdir):
         # attempts (15s apart), 5s pacing between windows, partial cues
         # are kept, and long audio fails loudly with the real window
         # error instead of silently returning a truncated transcript.
-        all_cues = []
-        model_name = None
-        last_err = None
-        failed_idx = None
+        # v44: refusal/junk replies and parse failures retry the window
+        # too (they used to become fake cues, or kill the whole job from
+        # outside the try). Long audio with a failed window fails loudly
+        # — partial cues must never silently drop the tail.
         for idx, (s, e) in enumerate(windows):
             seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
             seg_dur = e - s
@@ -511,14 +533,16 @@ def transcribe_cues(key, audio_path, duration, workdir):
                     continue
                 try:
                     m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
+                    if looks_like_junk(raw):
+                        raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
+                    seg_cues = split_long_cues(split_long_cues(
+                        parse_srt_text(raw, seg_dur)))
                 except Exception as ex:
                     last_err = ex
                     if attempt == 0:
                         time.sleep(15)
                     continue
                 model_name = model_name or m
-                seg_cues = split_long_cues(split_long_cues(
-                    parse_srt_text(raw, seg_dur)))
                 for (cs, ce, t) in seg_cues:
                     all_cues.append((cs + s, min(ce + s, duration), t))
                 ok = True
@@ -528,13 +552,21 @@ def transcribe_cues(key, audio_path, duration, workdir):
                 break
             if idx < len(windows) - 1:
                 time.sleep(5)
+        if failed_idx is None and all_cues:
+            all_cues.sort(key=lambda c: c[0])
+            return model_name, snap_cues_to_speech(all_cues, segments, duration)
+        if failed_idx is not None and duration > 90:
+            raise RuntimeError("window %s failed: %s" % (failed_idx, last_err))
+    try:
+        model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
+        if looks_like_junk(raw_text):
+            raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
+        cues = split_long_cues(split_long_cues(parse_srt_text(raw_text, duration)))
+    except Exception:
         if all_cues:
             all_cues.sort(key=lambda c: c[0])
             return model_name, snap_cues_to_speech(all_cues, segments, duration)
-        if duration > 90:
-            raise RuntimeError("window %s failed: %s" % (failed_idx, last_err))
-    model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
-    cues = split_long_cues(split_long_cues(parse_srt_text(raw_text, duration)))
+        raise
     return model_name, snap_cues_to_speech(cues, segments, duration)
 
 
@@ -1705,7 +1737,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v43 (auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v44 (refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + 60s-window long transcription + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
