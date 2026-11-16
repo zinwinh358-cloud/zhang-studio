@@ -25,6 +25,8 @@
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
 # v52 (2026-11-16): ZIN'S SPEED+ACCURACY merge for long videos (1-hour mp3; code from another AI, merged by Zuu — the pasted file was truncated mid-function, so the changes were applied onto the complete v50 file). 4-parallel windows, 45s windows, 3 models, timeout 90, retry sleep 3, no pacing, word-count cue split, snap window 1.2, ASS burn, 200MB audio cap. PLUS cue sanitization (strip HTML tags + CJK/Hangul chars, drop non-Myanmar cues, collapse duplicated text) — the 16 Nov v51-rejection lesson: unsanitized Gemini output burned Korean/HTML/duplicates. Named v52 because the parallel-3 build already used v51.
+# v53 (2026-11-16): narration blocks start 0.3s EARLY (build_timed_narration adelay shift, clamped at 0) — Zin's 16 Nov F1 test showed the Myanmar voice lagging slightly behind the subtitles.
+# v54 (2026-11-16): quota fail-loud — if 3+ windows hit QuotaExhaustedError, raise the quota error even when partial cues exist (16 Nov: quota died mid-run and the app burned a misleading middle-only partial video). 1-2 quota-failed windows still return partial cues per v45 (transient 429 burst).
 # v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
@@ -606,6 +608,7 @@ def transcribe_cues(key, audio_path, duration, workdir):
     model_name = None
     last_err = None
     quota_hit = False
+    quota_failed = 0
     stopped_early = False
     if windows:
         # v41: per-window retry + pacing + partial results. The old code
@@ -663,6 +666,7 @@ def transcribe_cues(key, audio_path, duration, workdir):
                 all_cues.extend(res[2])
             elif res[0] == "quota":
                 quota_hit = True
+                quota_failed += 1
                 if last_err is None:
                     last_err = res[1]
             else:
@@ -672,6 +676,16 @@ def transcribe_cues(key, audio_path, duration, workdir):
             # v47 parallel form: every window failed, so the
             # consecutive-failure run is the whole list.
             stopped_early = True
+        # v54 (2026-11-16): quota died mid-run (16 Nov: 2 parallel jobs
+        # on one key -> only the middle windows finished, and the app
+        # burned a misleading partial video). 1-2 quota-failed windows
+        # can be a transient 429 burst, so v45 partial return still
+        # applies there. 3+ quota-failed windows means the quota is
+        # really spent: raise the quota error instead of a partial
+        # video, so the user retries with fresh quota instead of
+        # watching a broken video. (3 mirrors v47's threshold.)
+        if quota_hit and quota_failed >= 3:
+            raise last_err
         if all_cues:
             all_cues.sort(key=lambda c: c[0])
             return model_name, snap_cues_to_speech(all_cues, segments, duration)
@@ -1263,7 +1277,10 @@ def build_timed_narration(workdir, cues, video_duration, voice, rate, pitch,
     mix_inputs = []
     for i, (start, path) in enumerate(fitted):
         inputs += ["-i", path]
-        delay_ms = int(round(start * 1000))
+        # v53: start each block 0.3s EARLY — edge-tts blocks carry a
+        # short leading silence, so narration felt slightly late
+        # behind the subtitles (Zin's 16 Nov F1 test). Clamped at 0.
+        delay_ms = max(0, int(round((start - 0.3) * 1000)))
         filters.append(f"[{i}:a]adelay={delay_ms}[a{i}]")
         mix_inputs.append(f"[a{i}]")
     filters.append(
@@ -1859,7 +1876,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v52 (4-parallel 45s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v54 (quota fail-loud + narration 0.3s early + 4-parallel 45s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
