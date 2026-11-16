@@ -27,6 +27,7 @@
 # v52 (2026-11-16): ZIN'S SPEED+ACCURACY merge for long videos (1-hour mp3; code from another AI, merged by Zuu — the pasted file was truncated mid-function, so the changes were applied onto the complete v50 file). 4-parallel windows, 45s windows, 3 models, timeout 90, retry sleep 3, no pacing, word-count cue split, snap window 1.2, ASS burn, 200MB audio cap. PLUS cue sanitization (strip HTML tags + CJK/Hangul chars, drop non-Myanmar cues, collapse duplicated text) — the 16 Nov v51-rejection lesson: unsanitized Gemini output burned Korean/HTML/duplicates. Named v52 because the parallel-3 build already used v51.
 # v53 (2026-11-16): narration blocks start 0.3s EARLY (build_timed_narration adelay shift, clamped at 0) — Zin's 16 Nov F1 test showed the Myanmar voice lagging slightly behind the subtitles.
 # v54 (2026-11-16): quota fail-loud — if 3+ windows hit QuotaExhaustedError, raise the quota error even when partial cues exist (16 Nov: quota died mid-run and the app burned a misleading middle-only partial video). 1-2 quota-failed windows still return partial cues per v45 (transient 429 burst).
+# v55 (2026-11-16): /api/detect-subs-zone — Gemini Vision finds the BAKED-IN subtitle band (y_start/y_end, 0=top) from up to 5 phone-sampled frames, so the phone blurs exactly where the original subtitles are instead of fixed bottom/top bands (Zin's 16 Nov screenshot: Chinese subs in the MIDDLE at ~60% height, blur bar useless at the bottom). Sync endpoint, one vision call; any failure → app falls back to the manual cover bands.
 # v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
@@ -1876,7 +1877,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v54 (quota fail-loud + narration 0.3s early + 4-parallel 45s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v55 (auto subtitle-zone detect + quota fail-loud + narration 0.3s early + 4-parallel 45s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
@@ -1927,6 +1928,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
 # + cue အစ/အဆုံး အသံနဲ့ ကပ်ခြင်း — transcribe_cues() က Tab 1 ရော API ရော သုံးတယ်
 if os.environ.get("RENDER"):
     from fastapi import FastAPI, File, Form, UploadFile
+    from typing import List
     from fastapi.responses import FileResponse, JSONResponse
     import shutil
     import threading
@@ -2374,6 +2376,107 @@ if os.environ.get("RENDER"):
                 except Exception:
                     pass
             return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @api_app.post("/api/detect-subs-zone")
+    def api_detect_subs_zone(frames: List[UploadFile] = File(...), api_key: str = Form(None)):
+        # v55: baked-in subtitle ZONE detection (Zin, 16 Nov). The fixed
+        # bottom/top blur bands missed videos whose baked-in subtitles
+        # sit in the MIDDLE of the frame (his screenshot: Chinese subs
+        # at ~60% height, blur bar at the bottom). The phone samples a
+        # few frames, Gemini Vision finds the subtitle band, the phone
+        # blurs exactly there. Synchronous: one vision call, a few
+        # seconds — no job polling. Any failure returns an error and
+        # the app falls back to the manual cover bands.
+        import json
+        if not (api_key or "").strip():
+            return JSONResponse(status_code=400, content={"error": "Gemini API key လိုပါတယ်။"})
+        if not frames:
+            return JSONResponse(status_code=400, content={"error": "no frames"})
+        parts = []
+        for f in frames[:5]:
+            try:
+                raw = f.file.read(1024 * 1024)
+            except Exception:
+                continue
+            if not raw:
+                continue
+            mime = f.content_type or "image/jpeg"
+            if not mime.startswith("image/"):
+                mime = "image/jpeg"
+            parts.append({"inline_data": {"mime_type": mime,
+                                          "data": base64.b64encode(raw).decode("utf-8")}})
+        if not parts:
+            return JSONResponse(status_code=400, content={"error": "empty frames"})
+        prompt = (
+            "These are frames from the same video. Find the BURNED-IN subtitle text: "
+            "caption words overlaid on the picture (usually one line, same place in "
+            "every frame) — NOT street signs, NOT shop signs, NOT logos, NOT watermarks. "
+            "If the same subtitle position appears in most frames, return ONLY this JSON: "
+            "{\"found\": true, \"y_start\": <top edge 0.0-1.0>, \"y_end\": <bottom edge 0.0-1.0>} "
+            "where 0.0 is the TOP of the frame and 1.0 is the BOTTOM; cover ONLY the subtitle "
+            "text height plus a tiny margin. "
+            "If NO burned-in subtitles appear, return ONLY: {\"found\": false}. "
+            "Return ONLY the JSON object, no other text."
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}] + parts}],
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+        }
+        headers = {"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"}
+        seen_429 = 0
+        reply = None
+        for name in CANDIDATE_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=90)
+            except requests.exceptions.RequestException:
+                continue
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+                cands = data.get("candidates", [])
+                cparts = cands[0].get("content", {}).get("parts", []) if cands else []
+                texts = [p.get("text", "") for p in cparts if isinstance(p, dict) and "text" in p]
+                if texts:
+                    reply = "\n".join(texts)
+                    break
+                continue
+            if resp.status_code == 429:
+                seen_429 += 1
+                continue
+            if resp.status_code in (404, 503):
+                continue
+            return JSONResponse(status_code=502, content={"error": f"Gemini API error {resp.status_code}"})
+        if reply is None:
+            if seen_429 == len(CANDIDATE_MODELS):
+                return JSONResponse(status_code=429, content={"error": "Gemini quota ကုန်နေတယ်။ 15:00 လောက် ပြန်ရမယ် (သို့) Gmail အသစ်နဲ့ key အသစ် ပြောင်းသုံးပါ။"})
+            return JSONResponse(status_code=502, content={"error": "model တွေ အလုပ်များနေတယ်။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ။"})
+        m = re.search(r"\{.*?\}", reply, re.S)
+        if not m:
+            return JSONResponse(content={"found": False})
+        try:
+            zone = json.loads(m.group(0))
+        except ValueError:
+            return JSONResponse(content={"found": False})
+        if not zone.get("found"):
+            return JSONResponse(content={"found": False})
+        try:
+            ys = float(zone["y_start"])
+            ye = float(zone["y_end"])
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse(content={"found": False})
+        # Sanity: a subtitle band is a thin horizontal strip; reject
+        # absurd boxes (hallucinated full-frame zones) and clamp.
+        if not (0.0 <= ys < ye <= 1.0) or (ye - ys) > 0.35:
+            return JSONResponse(content={"found": False})
+        return JSONResponse(content={"found": True, "y_start": round(ys, 3), "y_end": round(ye, 3)})
 
     @api_app.post("/api/tts")
     def api_tts(text: str = Form(...), voice: str = Form("my-MM-NilarNeural"),
