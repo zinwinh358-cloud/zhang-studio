@@ -29,6 +29,7 @@
 # v54 (2026-11-16): quota fail-loud — if 3+ windows hit QuotaExhaustedError, raise the quota error even when partial cues exist (16 Nov: quota died mid-run and the app burned a misleading middle-only partial video). 1-2 quota-failed windows still return partial cues per v45 (transient 429 burst).
 # v55 (2026-11-16): /api/detect-subs-zone — Gemini Vision finds the BAKED-IN subtitle band (y_start/y_end, 0=top) from up to 5 phone-sampled frames, so the phone blurs exactly where the original subtitles are instead of fixed bottom/top bands (Zin's 16 Nov screenshot: Chinese subs in the MIDDLE at ~60% height, blur bar useless at the bottom). Sync endpoint, one vision call; any failure → app falls back to the manual cover bands.
 # v56 (2026-11-17): 45s -> 30s transcription windows (TIMING FIX) — Zin's 117s drama: subtitles accurate at the start, EARLY in the middle, OK again at the end (17 Nov 00:48 video). Gemini's timestamp estimates drift inside long windows; each window is independent so the error humps per-window instead of accumulating. 30s was v50's proven setting. Costs 1.5x Gemini calls vs 45s. VAD snap ruled OUT for this video (silencedetect found no silence in 117s of music+dialogue, so snap was a no-op).
+# v57 (2026-11-17): FAIL FAST — 3 failed windows + 0 successes aborts the job at once (cancel pending windows) instead of grinding every window through 2 attempts x 3 models; Gemini timeout 90 -> 60s; 'models busy' error now also mentions quota/key-switch. Zin's 1-min video took ~10 min to fail 4x in a row (17 Nov 01:17) — Gemini not answering (overload and/or quota spent); retries turned it into a 10-min grind. v56's 30s windows did NOT cause this (a ~60s video has ~2 windows either way).
 # v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
@@ -234,7 +235,7 @@ def transcribe_with_gemini(api_key, audio_path, duration):
     for name in CANDIDATE_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=90)
+            resp = requests.post(url, json=payload, headers=headers, timeout=60)
         except requests.exceptions.RequestException:
             continue
         if resp.status_code == 200:
@@ -642,6 +643,12 @@ def transcribe_cues(key, audio_path, duration, workdir):
         # stopped the job the same way).
         max_workers = min(4, len(windows))
         results = [None] * len(windows)
+        # v57: fail fast — count outcomes as they land; if 3 windows
+        # fail with ZERO successes, everything is failing (overload or
+        # quota) — stop starting new windows instead of grinding all
+        # of them (Zin's 1-min video took 10 min to fail, 17 Nov 01:17).
+        ok_count = 0
+        fail_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = {
                 ex.submit(_transcribe_one_window, key, audio_path, workdir,
@@ -654,14 +661,21 @@ def transcribe_cues(key, audio_path, duration, workdir):
                     m, seg_cues = fut.result()
                 except QuotaExhaustedError as qe:
                     results[idx] = ("quota", qe)
-                    continue
                 except Exception as ex2:
                     results[idx] = ("error", ex2)
-                    continue
-                if m is None:
-                    results[idx] = ("error", RuntimeError("window failed"))
                 else:
-                    results[idx] = ("ok", m, seg_cues)
+                    if m is None:
+                        results[idx] = ("error", RuntimeError("window failed"))
+                    else:
+                        results[idx] = ("ok", m, seg_cues)
+                if results[idx][0] == "ok":
+                    ok_count += 1
+                else:
+                    fail_count += 1
+                if fail_count >= 3 and ok_count == 0:
+                    for f in futs:
+                        f.cancel()
+                    break
         for res in results:
             if res is None:
                 continue
@@ -697,7 +711,7 @@ def transcribe_cues(key, audio_path, duration, workdir):
         if quota_hit:
             raise last_err
         if stopped_early:
-            raise RuntimeError("model တွေ အလုပ်များနေတယ်။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ။")
+            raise RuntimeError("model တွေ အလုပ်များနေတယ် (သို့) quota ကုန်နေတယ်။ ခဏစောင့်ပြီး ထပ်နှိပ်ပါ (သို့) key အသစ် ပြောင်းသုံးပါ။")
     try:
         model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
         if looks_like_junk(raw_text):
@@ -1881,7 +1895,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v56 (timing fix: 30s windows + auto subtitle-zone detect + quota fail-loud + narration 0.3s early + 4-parallel 30s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v57 (fail-fast on overload/quota + timing fix: 30s windows + auto subtitle-zone detect + quota fail-loud + narration 0.3s early + 4-parallel 30s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
