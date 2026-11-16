@@ -28,6 +28,7 @@
 # v53 (2026-11-16): narration blocks start 0.3s EARLY (build_timed_narration adelay shift, clamped at 0) — Zin's 16 Nov F1 test showed the Myanmar voice lagging slightly behind the subtitles.
 # v54 (2026-11-16): quota fail-loud — if 3+ windows hit QuotaExhaustedError, raise the quota error even when partial cues exist (16 Nov: quota died mid-run and the app burned a misleading middle-only partial video). 1-2 quota-failed windows still return partial cues per v45 (transient 429 burst).
 # v55 (2026-11-16): /api/detect-subs-zone — Gemini Vision finds the BAKED-IN subtitle band (y_start/y_end, 0=top) from up to 5 phone-sampled frames, so the phone blurs exactly where the original subtitles are instead of fixed bottom/top bands (Zin's 16 Nov screenshot: Chinese subs in the MIDDLE at ~60% height, blur bar useless at the bottom). Sync endpoint, one vision call; any failure → app falls back to the manual cover bands.
+# v56 (2026-11-17): 45s -> 30s transcription windows (TIMING FIX) — Zin's 117s drama: subtitles accurate at the start, EARLY in the middle, OK again at the end (17 Nov 00:48 video). Gemini's timestamp estimates drift inside long windows; each window is independent so the error humps per-window instead of accumulating. 30s was v50's proven setting. Costs 1.5x Gemini calls vs 45s. VAD snap ruled OUT for this video (silencedetect found no silence in 117s of music+dialogue, so snap was a no-op).
 # v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
@@ -592,10 +593,13 @@ def transcribe_cues(key, audio_path, duration, workdir):
         # audio (fewer calls = faster + less quota). A short tail
         # (<5s) joins the previous window instead of becoming a stub
         # window.
+        # v56 (17 Nov): 45s -> 30s — Gemini timestamps drift inside
+        # 45s windows (Zin's 117s video: early in the middle, OK at
+        # both ends). 1.5x calls, but timing accuracy is the spec.
         windows = []
         t = 0.0
         while t < duration:
-            nxt = min(t + 45.0, duration)
+            nxt = min(t + 30.0, duration)
             if duration - nxt < 5.0 and nxt < duration:
                 nxt = duration
             windows.append((t, nxt))
@@ -1877,7 +1881,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v55 (auto subtitle-zone detect + quota fail-loud + narration 0.3s early + 4-parallel 45s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v56 (timing fix: 30s windows + auto subtitle-zone detect + quota fail-loud + narration 0.3s early + 4-parallel 30s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
