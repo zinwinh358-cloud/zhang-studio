@@ -24,6 +24,7 @@
 # v35 (2026-11-14): /api/transcribe accepts AUDIO-ONLY uploads too — phone extracts audio (.m4a) and uploads only that (~10x less upload data, much faster on slow connections). _run_job detects a video stream with ffprobe; audio-only files go through transcribe_audio_file (probe_video KeyErrors on 'width' for them).
 # v36 (2026-11-14): CHUNKED uploads — POST /api/upload-chunk (1MB parts, idempotent, resumable) + POST /api/upload-complete (joins parts, starts the transcribe or voiceover-audio job). A broken connection loses one part, not the whole file; the app retries each part. Stale part-dirs (>2h) pruned in _prune_jobs.
 # v37 (2026-11-14): LONG-audio transcription — audio over 60s is split into fixed 60s windows, each transcribed separately (single whole-audio Gemini calls truncate: the 479s wonton drama came back with only 2 cues on 14 Nov). Same window loop as short clips; whole-audio remains the fallback.
+# v52 (2026-11-16): ZIN'S SPEED+ACCURACY merge for long videos (1-hour mp3; code from another AI, merged by Zuu — the pasted file was truncated mid-function, so the changes were applied onto the complete v50 file). 4-parallel windows, 45s windows, 3 models, timeout 90, retry sleep 3, no pacing, word-count cue split, snap window 1.2, ASS burn, 200MB audio cap. PLUS cue sanitization (strip HTML tags + CJK/Hangul chars, drop non-Myanmar cues, collapse duplicated text) — the 16 Nov v51-rejection lesson: unsanitized Gemini output burned Korean/HTML/duplicates. Named v52 because the parallel-3 build already used v51.
 # v50 (2026-11-15): 30s transcription windows (was 60s) — Gemini drops short shouted lines inside dense noisy 60s windows (Zin's 86s drama lost the 8-9s and 21-24s shouts, 15 Nov 18:22 SRT). Prompt: include shouts/exclamations/single-word utterances; transliterate personal names (never replace a name with a description).
 # v49 (2026-11-15): /api/voiceover-srt — SRT text + video duration → timed Myanmar narration (mp3 + m4a), no audio upload; for videos with no usable audio.
 # v48 (2026-11-15): strip bracketed time tokens (e.g. '[00:03:775:ကပ်]') from cue text — Gemini sometimes returns word-timing blobs; Zin's 7-min video burned them into the subtitles from ~3:00 on. Applied to every cue in parse_srt_text (both SRT and fallback paths); cues left empty are dropped.
@@ -117,9 +118,7 @@ FAVICON_PATH = _local_or_download(
     "zhang-studio-favicon.png",
     "https://muse.ai/files/1475283228992014/1148245037715311/56ul0wu34oapc6mosgqmm17z/zhang-studio-favicon.png")
 
-CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite",
-                    "gemini-3.7-flash", "gemini-flash-latest", "gemini-3.5-flash",
-                    "gemini-2.5-flash", "gemini-2.0-flash"]
+CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-flash-latest"]
 
 VOICES = {"အမျိုးသမီး အသံ (Nilar)": "my-MM-NilarNeural",
           "အယောက်ျား အသံ (Thiha)": "my-MM-ThihaNeural"}
@@ -172,6 +171,17 @@ def format_time(seconds):
 
 # ---------------- Tab 1: video စာတန်းထိုး ----------------
 
+def format_ass_time(seconds):
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs >= 100:
+        cs = 99
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+
 class QuotaExhaustedError(RuntimeError):
     """All candidate models answered 429: the Gemini quota is spent."""
     pass
@@ -220,7 +230,7 @@ def transcribe_with_gemini(api_key, audio_path, duration):
     for name in CANDIDATE_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent"
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=180)
+            resp = requests.post(url, json=payload, headers=headers, timeout=90)
         except requests.exceptions.RequestException:
             continue
         if resp.status_code == 200:
@@ -257,7 +267,7 @@ def looks_like_junk(raw_text):
     return not any("\u1000" <= ch <= "\u109f" for ch in raw_text)
 
 
-def parse_srt_text(raw_text, duration):
+def parse_srt_text(raw_text, duration, sanitize=False):
     clean = re.sub(r"```\w*", "", raw_text).strip()
     ts_re = re.compile(r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})")
     lines = clean.splitlines()
@@ -299,6 +309,21 @@ def parse_srt_text(raw_text, duration):
         # v48: drop bracketed tokens like [00:03:775:xxx] (word-timing
         # junk Gemini sometimes mixes into cue text).
         text = re.sub(r"\[[^\]\n]*\]", "", text)
+        if sanitize:
+            # v52: Gemini sometimes returns HTML tags, foreign-script
+            # words, or the same line twice (16 Nov: a Korean cue, raw
+            # <span> tags, duplicated lines, untranslated 當年
+            # burned into videos). Clean those here. Gemini output
+            # ONLY — user-supplied SRT (voiceover/TTS paths) passes
+            # sanitize=False and is untouched.
+            text = re.sub(r"<[^>\n]*>", "", text)
+            text = re.sub("[\u1100-\u11ff\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uff00-\uffef]", "", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            words = text.split(" ")
+            if len(words) >= 2 and len(words) % 2 == 0 and words[:len(words) // 2] == words[len(words) // 2:]:
+                text = " ".join(words[:len(words) // 2])
+            if not any("\u1000" <= ch <= "\u109f" for ch in text):
+                continue
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
@@ -309,9 +334,7 @@ def parse_srt_text(raw_text, duration):
     return fixed
 
 
-def split_long_cues(cues, max_dur=5.0):
-    # ရှည်တဲ့ cue (ဥပမာ 16 စက္ကန့် တစ်ပိုင်း) ကို အတိုလေးတွေ ခွဲခြင်း —
-    # စာသား အရှည်အလိုက် အချိန် ခွဲဝေတယ် (အသံနဲ့ လိုက်ဖက် ပိုနီးစပ်အောင်)
+def split_long_cues(cues, max_dur=4.0):
     out = []
     for start, end, text in cues:
         dur = end - start
@@ -319,19 +342,11 @@ def split_long_cues(cues, max_dur=5.0):
         if n <= 1:
             out.append((start, end, text))
             continue
-        parts = [p.strip() for p in re.split(r"(?<=[။,])\s*", text.strip()) if p.strip()]
-        if len(parts) < n:
-            words = text.split(" ")
-            target = max(1, len(text) // n)
-            parts, cur = [], ""
-            for w in words:
-                if cur and len(cur) + len(w) + 1 > target:
-                    parts.append(cur)
-                    cur = w
-                else:
-                    cur = (cur + " " + w).strip()
-            if cur:
-                parts.append(cur)
+        words = text.split()
+        if not words:
+            continue
+        per = max(1, math.ceil(len(words) / n))
+        parts = [" ".join(words[i:i + per]) for i in range(0, len(words), per)]
         total = sum(len(p) for p in parts) or 1
         t = start
         for k, p in enumerate(parts):
@@ -390,35 +405,49 @@ def render_cue_png(text, w, h, font_path, font_size, out_path):
     return band_top
 
 
+def _escape_ass_text(text):
+    return (text.replace("\\", "\uff3c").replace("{", "\uff08").replace("}", "\uff09")
+            .replace("\n", " "))
+
+
 def burn_subtitles(video_path, cues, out_path, font_path):
     w, h, duration = probe_video(video_path)
-    # Render အခမဲ့ CPU (0.1) မှာ မြန်အောင် — အရှည်ဆုံး ဘက်ကို 1280 အထိ ချုံ့မယ်။
     scale = 1280 / max(w, h) if max(w, h) > 1280 else 1.0
     sw = max(2, int(w * scale) // 2 * 2)
     sh = max(2, int(h * scale) // 2 * 2)
     font_size = max(24, int(sh * 0.045))
-    tmpdir = tempfile.mkdtemp(prefix="cues_")
-    pngs = []
-    for k, (start, end, text) in enumerate(cues):
-        p = os.path.join(tmpdir, f"cue_{k}.png")
-        y_off = render_cue_png(text, sw, sh, font_path, font_size, p)
-        pngs.append((p, start, end, y_off))
-    cmd = ["ffmpeg", "-y", "-i", video_path]
-    for p, _, _, _ in pngs:
-        cmd += ["-loop", "1", "-t", str(duration), "-i", p]
-    filt = f"[0:v]scale={sw}:{sh}[base];"
-    prev = "base"
-    for k, (_, start, end, y_off) in enumerate(pngs):
-        out = f"v{k}"
-        filt += f"[{prev}][{k + 1}:v]overlay=0:{y_off}:enable='between(t,{start:.3f},{end:.3f})'[{out}];"
-        prev = out
-    cmd += ["-filter_complex", filt.rstrip(";"),
-            "-map", f"[{prev}]", "-map", "0:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-            "-c:a", "copy", out_path]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=1800)
+    tmpdir = tempfile.mkdtemp(prefix="ass_")
+    ass_path = os.path.join(tmpdir, "sub.ass")
+    font_dir = os.path.dirname(font_path) if font_path else None
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("[Script Info]\n")
+        f.write("ScriptType: v4.00+\n")
+        f.write(f"PlayResX: {sw}\nPlayResY: {sh}\n")
+        f.write("WrapStyle: 2\nScaledBorderAndShadow: yes\n\n")
+        f.write("[V4+ Styles]\n")
+        f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding\n")
+        f.write(f"Style: Default,Padauk,{font_size},&H00FFFFFF,&H000000FF,"
+                "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,3,0,"
+                f"2,20,20,{max(20, int(sh * 0.06))},1\n\n")
+        f.write("[Events]\n")
+        f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+                "MarginV, Effect, Text\n")
+        for start, end, text in cues:
+            f.write(f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},"
+                    f"Default,,0,0,0,,{_escape_ass_text(text)}\n")
+    vf = f"subtitles={ass_path}"
+    if font_dir:
+        vf += f":fontsdir={font_dir}"
+    vf += f",scale={sw}:{sh}"
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", vf,
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+           "-c:a", "copy", out_path]
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=7200)
     if r.returncode != 0 or not os.path.exists(out_path):
-        raise RuntimeError("video ထဲ စာတန်း ထည့်လို့ မရဘူး: " + r.stderr[-300:])
+        raise RuntimeError("video \u1011\u1004\u103a စာတန်း ထည့်လို့ မရဘူး: " + r.stderr[-300:])
 
 
 # ---------------- Exact timing (v18) ----------------
@@ -462,7 +491,7 @@ def detect_speech_segments(audio_path, duration):
     return [(s, e) for s, e in segments if e - s >= 0.3]
 
 
-def snap_cues_to_speech(cues, segments, duration, window=0.6):
+def snap_cues_to_speech(cues, segments, duration, window=1.2):
     """Snap each cue's start/end to the nearest speech-segment boundary
     within `window` seconds (fixes subtitles appearing in silence)."""
     if not segments or not cues:
@@ -485,6 +514,39 @@ def snap_cues_to_speech(cues, segments, duration, window=0.6):
         out.append((ns, ne, text))
         prev_end = ne
     return out
+
+
+def _transcribe_one_window(key, audio_path, workdir, idx, s, e, duration):
+    seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
+    seg_dur = e - s
+    last_err = None
+    for attempt in range(2):
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", audio_path,
+             "-t", f"{seg_dur:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
+             seg_path],
+            capture_output=True, text=True, errors="ignore", timeout=120)
+        if r.returncode != 0 or not os.path.exists(seg_path):
+            last_err = RuntimeError("segment extract failed")
+            if attempt == 0:
+                time.sleep(2)
+            continue
+        try:
+            m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
+            if looks_like_junk(raw):
+                raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
+            seg_cues = split_long_cues(split_long_cues(
+                parse_srt_text(raw, seg_dur, sanitize=True)))
+        except QuotaExhaustedError:
+            raise
+        except Exception as ex:
+            last_err = ex
+            if attempt == 0:
+                time.sleep(3)
+            continue
+        return m, [(cs + s, min(ce + s, duration), t) for cs, ce, t in seg_cues]
+    _ = last_err
+    return None, None
 
 
 def transcribe_cues(key, audio_path, duration, workdir):
@@ -523,12 +585,14 @@ def transcribe_cues(key, audio_path, duration, workdir):
         # window: Zin's 86s drama lost the 8-9s and 21-24s shouts
         # (15 Nov 18:22 SRT) although both windows "succeeded".
         # Shorter windows = less audio per call = fewer missed lines.
-        # A short tail (<5s) joins the previous window instead of
-        # becoming a stub window.
+        # v52 (Zin's spec, 16 Nov): 30s -> 45s windows for 1-hour
+        # audio (fewer calls = faster + less quota). A short tail
+        # (<5s) joins the previous window instead of becoming a stub
+        # window.
         windows = []
         t = 0.0
         while t < duration:
-            nxt = min(t + 30.0, duration)
+            nxt = min(t + 45.0, duration)
             if duration - nxt < 5.0 and nxt < duration:
                 nxt = duration
             windows.append((t, nxt))
@@ -541,16 +605,14 @@ def transcribe_cues(key, audio_path, duration, workdir):
     all_cues = []
     model_name = None
     last_err = None
-    failed_idx = None
     quota_hit = False
-    consec_fail = 0
     stopped_early = False
     if windows:
         # v41: per-window retry + pacing + partial results. The old code
         # discarded ALL windows when any one call failed and fell through
         # to a whole-audio call that truncates long audio (two 479s jobs
         # errored this way, 14 Nov 22:03/22:05). Each window gets 2
-        # attempts (15s apart), 5s pacing between windows.
+        # attempts.
         # v44: refusal/junk replies and parse failures retry the window
         # too (they used to become fake cues, or kill the whole job from
         # outside the try).
@@ -562,54 +624,54 @@ def transcribe_cues(key, audio_path, duration, workdir):
         # message — no 20-minute grind; partial cues are still returned.
         # v47: 3 consecutive fully-failed windows stop the job (any
         # cause) — overload grinds the same way quota does.
-        for idx, (s, e) in enumerate(windows):
-            seg_path = os.path.join(workdir, f"chunk{idx}.mp3")
-            seg_dur = e - s
-            ok = False
-            for attempt in range(2):
-                r = subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", audio_path,
-                     "-t", f"{seg_dur:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
-                     seg_path],
-                    capture_output=True, text=True, errors="ignore", timeout=300)
-                if r.returncode != 0 or not os.path.exists(seg_path):
-                    last_err = RuntimeError("segment extract failed")
-                    if attempt == 0:
-                        time.sleep(5)
-                    continue
+        # v52 (Zin's spec, 16 Nov): 4 windows AT A TIME
+        # (ThreadPoolExecutor) for 1-hour audio, no pacing sleep.
+        # Same 2 attempts per window. v45/v46/v47 semantics in
+        # parallel form: a failed window is skipped (never fatal);
+        # a quota error raises fast with partial cues returned; with
+        # no cues at all from 3+ windows the overload error is
+        # raised (sequentially, any all-failed run of 3+ windows
+        # stopped the job the same way).
+        max_workers = min(4, len(windows))
+        results = [None] * len(windows)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {
+                ex.submit(_transcribe_one_window, key, audio_path, workdir,
+                          idx, s, e, duration): idx
+                for idx, (s, e) in enumerate(windows)
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                idx = futs[fut]
                 try:
-                    m, raw = transcribe_with_gemini(key, seg_path, seg_dur)
-                    if looks_like_junk(raw):
-                        raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
-                    seg_cues = split_long_cues(split_long_cues(
-                        parse_srt_text(raw, seg_dur)))
+                    m, seg_cues = fut.result()
                 except QuotaExhaustedError as qe:
-                    last_err = qe
-                    quota_hit = True
-                    break
-                except Exception as ex:
-                    last_err = ex
-                    if attempt == 0:
-                        time.sleep(15)
+                    results[idx] = ("quota", qe)
                     continue
-                model_name = model_name or m
-                for (cs, ce, t) in seg_cues:
-                    all_cues.append((cs + s, min(ce + s, duration), t))
-                ok = True
-                break
-            if ok:
-                consec_fail = 0
-            if not ok:
-                failed_idx = idx
-                consec_fail += 1
-                # v45: skip this window, continue with the next one.
-            if quota_hit:
-                break
-            if consec_fail >= 3:
-                stopped_early = True
-                break
-            if idx < len(windows) - 1:
-                time.sleep(5)
+                except Exception as ex2:
+                    results[idx] = ("error", ex2)
+                    continue
+                if m is None:
+                    results[idx] = ("error", RuntimeError("window failed"))
+                else:
+                    results[idx] = ("ok", m, seg_cues)
+        for res in results:
+            if res is None:
+                continue
+            if res[0] == "ok":
+                if model_name is None:
+                    model_name = res[1]
+                all_cues.extend(res[2])
+            elif res[0] == "quota":
+                quota_hit = True
+                if last_err is None:
+                    last_err = res[1]
+            else:
+                if last_err is None:
+                    last_err = res[1]
+        if not all_cues and len(windows) >= 3 and not quota_hit:
+            # v47 parallel form: every window failed, so the
+            # consecutive-failure run is the whole list.
+            stopped_early = True
         if all_cues:
             all_cues.sort(key=lambda c: c[0])
             return model_name, snap_cues_to_speech(all_cues, segments, duration)
@@ -621,7 +683,7 @@ def transcribe_cues(key, audio_path, duration, workdir):
         model_name, raw_text = transcribe_with_gemini(key, audio_path, duration)
         if looks_like_junk(raw_text):
             raise RuntimeError("Gemini က ဒီအသံကို ရေးမပေးဘူး (ငြင်းဆန်စာ)။")
-        cues = split_long_cues(split_long_cues(parse_srt_text(raw_text, duration)))
+        cues = split_long_cues(split_long_cues(parse_srt_text(raw_text, duration, sanitize=True)))
     except Exception:
         if all_cues:
             all_cues.sort(key=lambda c: c[0])
@@ -644,8 +706,8 @@ def transcribe_video_file(video_path, api_key=None):
                        capture_output=True, text=True, errors="ignore", timeout=600)
     if r.returncode != 0 or not os.path.exists(audio_path):
         raise RuntimeError("Could not extract audio — does the video have sound?")
-    if os.path.getsize(audio_path) > 15_000_000:
-        raise RuntimeError("Video too long — try a clip under 10 minutes")
+    if os.path.getsize(audio_path) > 200_000_000:
+        raise RuntimeError("Audio too large — 200MB limit")
     _, _, duration = probe_video(video_path)
     model_name, cues = transcribe_cues(key, audio_path, duration, workdir)
     parts = []
@@ -670,8 +732,8 @@ def transcribe_audio_file(audio_path_in, api_key=None):
                        capture_output=True, text=True, errors="ignore", timeout=600)
     if r.returncode != 0 or not os.path.exists(audio_path):
         raise RuntimeError("အသံဖိုင်ကို ဖတ်လို့ မရဘူး။")
-    if os.path.getsize(audio_path) > 15_000_000:
-        raise RuntimeError("အသံဖိုင် အရမ်းကြီးပါတယ် — 10 မိနစ်အောက် အပိုင်း သုံးပါ။")
+    if os.path.getsize(audio_path) > 200_000_000:
+        raise RuntimeError("အသံဖိုင် အရမ်းကြီးပါတယ် — 200MB အောက် သုံးပါ။")
     try:
         duration = probe_duration(audio_path_in) or 0.0
     except Exception:
@@ -705,8 +767,8 @@ def process_subtitle(api_key, video):
         if r.returncode != 0 or not os.path.exists(audio_path):
             yield "❌ အသံ ထုတ်လို့ မရဘူး။ video မှာ အသံပါလား စစ်ပါ။", "", None, None
             return
-        if os.path.getsize(audio_path) > 15_000_000:
-            yield "⚠️ Video အရမ်းရှည်တယ် — ၁၀ မိနစ်အောက် clip နဲ့ စမ်းပါ။", "", None, None
+        if os.path.getsize(audio_path) > 200_000_000:
+            yield "⚠️ Video အရမ်းရှည်တယ် — 200MB အောက် clip နဲ့ စမ်းပါ။", "", None, None
             return
         _, _, duration = probe_video(video)
         model_name, cues = transcribe_cues(key, audio_path, duration, workdir)
@@ -1797,7 +1859,7 @@ with gr.Blocks(title="Zhang Studio") as demo:
     if BANNER_PATH:
         gr.Image(value=BANNER_PATH, show_label=False)
     gr.Markdown("# Zhang Studio")
-    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v50 (30s windows + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
+    gr.Markdown("မြန်မာစာတန်းထိုး + အသံဖတ်ပြ · v52 (4-parallel 45s windows + ASS burn + 200MB cap + cue sanitization + shouts/names prompt; voiceover-srt: SRT → timed Myanmar narration, no audio needed + strip time tokens + stop after 3 failed windows + silent-window skip + refusal detection + complete-transcription prompt + auto Myanmar title in resolve + 480p link downloads + merged-format flatten + window retry/pacing + HTML link fallback + resolve error detail + link resolve + chunked uploads: 1MB parts + resume + transcribe accepts audio-only uploads + Gemini TTS no style prompt — story text only, nothing else can be spoken + voiceover-audio: အသံပဲ တင် → မြန်မာအသံ + SRT, video မထုတ် + Gemini TTS မြန်မာ style ညွှန်ကြားချက် — အင်္ဂလိပ် အသံ မပါတော့ + MTV: ပုံ + သီချင်း Link/နာမည် → အကောင်းဆုံး 20 စက္ကန့် MTV + prompt-video auto character voices + faithful prompt-video script + 3 prompt-video images + timed voiceover narration + video preview on top + Gemini expressive voice + image narration)")
     with gr.Tab("🎬 Video စာတန်းထိုး"):
         gr.Markdown("video တင် → Gemini က အသံနားထောင်ပြီး မြန်မာစာတန်း ထိုးပေးမယ်။")
         gr.Markdown(key_note)
